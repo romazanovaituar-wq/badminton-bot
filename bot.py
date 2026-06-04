@@ -46,7 +46,7 @@ ADMIN_ID         = 942577691  # Telegram ID администратора
 def _is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
-SHIRT_COLOR, OPPONENT_SHIRT, VIDEO = range(3)
+IDENTIFY, SHIRT_COLOR, POSITION, VIDEO = range(4)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -101,37 +101,96 @@ def _download_video_sync(url: str, dest_path: str) -> bool:
     return os.path.exists(dest_path)
 
 
+def _save_frame(frame, output_dir: str, index: int, time_s: float) -> dict:
+    """Сохраняет кадр с ресайзом и возвращает метаданные."""
+    h, w = frame.shape[:2]
+    if w > 800:
+        frame = cv2.resize(frame, (800, int(h * 800 / w)))
+    path = f"{output_dir}/frame_{index:03d}.jpg"
+    cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return {"path": path, "time": time_s}
+
+
 def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
+    """
+    Надёжное извлечение кадров с трёхуровневым фоллбэком:
+    1) кадры с движением (умный выбор)
+    2) равномерно по времени (если движения мало)
+    3) любые доступные кадры (если видео короткое/проблемное)
+    Гарантированно не возвращает пустоту если в видео есть кадры.
+    """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    prev_gray = None
-    saved: list[dict] = []
-    idx = 0
-    last_saved = -30
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    while len(saved) < MAX_FRAMES:
+    # --- Уровень 1: motion detection ---
+    motion: list[dict] = []
+    prev_gray = None
+    idx = 0
+    last_saved = -fps
+    while len(motion) < MAX_FRAMES:
         ret, frame = cap.read()
         if not ret:
             break
-        if idx % 5 != 0:
-            idx += 1
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
-        if prev_gray is not None:
-            diff = cv2.absdiff(gray, prev_gray).mean()
-            if diff > MOTION_THRESHOLD and (idx - last_saved) > fps:
-                path = f"{output_dir}/frame_{len(saved):03d}.jpg"
-                h, w = frame.shape[:2]
-                if w > 800:
-                    frame = cv2.resize(frame, (800, int(h * 800 / w)))
-                cv2.imwrite(path, frame)
-                saved.append({"path": path, "time": idx / fps})
-                last_saved = idx
-        prev_gray = gray
+        if idx % 5 == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+            if prev_gray is not None:
+                diff = cv2.absdiff(gray, prev_gray).mean()
+                if diff > MOTION_THRESHOLD and (idx - last_saved) > fps:
+                    motion.append(_save_frame(frame, output_dir, len(motion), idx / fps))
+                    last_saved = idx
+            prev_gray = gray
+        idx += 1
+
+    if len(motion) >= 8:
+        cap.release()
+        logger.info("Извлечено %d кадров (motion)", len(motion))
+        return motion
+
+    # --- Уровень 2: равномерно по видео ---
+    # Чистим то что насобирал уровень 1
+    for fobj in motion:
+        try:
+            os.remove(fobj["path"])
+        except OSError:
+            pass
+
+    uniform: list[dict] = []
+    if total > 0:
+        step = max(1, total // MAX_FRAMES)
+        for i in range(0, total, step):
+            if len(uniform) >= MAX_FRAMES:
+                break
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            if ret:
+                uniform.append(_save_frame(frame, output_dir, len(uniform), i / fps))
+    if len(uniform) >= 3:
+        cap.release()
+        logger.info("Извлечено %d кадров (uniform)", len(uniform))
+        return uniform
+
+    # --- Уровень 3: берём вообще всё что есть ---
+    for fobj in uniform:
+        try:
+            os.remove(fobj["path"])
+        except OSError:
+            pass
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    any_frames: list[dict] = []
+    idx = 0
+    while len(any_frames) < MAX_FRAMES:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % 10 == 0:
+            any_frames.append(_save_frame(frame, output_dir, len(any_frames), idx / fps))
         idx += 1
     cap.release()
-    return saved
+    logger.info("Извлечено %d кадров (fallback)", len(any_frames))
+    return any_frames
 
 
 # ==================================================
@@ -142,9 +201,9 @@ def _encode_image(path: str) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def _analyze_sync(frames: list[dict], shirt: str, opp: str,
+def _analyze_sync(frames: list[dict], target: str,
                   name: str, lang: str) -> str:
-    frame_prompt = t(lang, "frame_prompt", shirt=shirt, opp=opp)
+    frame_prompt = t(lang, "frame_prompt", target=target)
     descriptions: list[str] = []
 
     for i, frame in enumerate(frames):
@@ -167,7 +226,7 @@ def _analyze_sync(frames: list[dict], shirt: str, opp: str,
         return "Could not analyze — player not visible in frames."
 
     report_prompt = t(lang, "report_prompt",
-                      n=len(descriptions), name=name, shirt=shirt,
+                      n=len(descriptions), name=name, target=target,
                       frames="\n".join(descriptions))
     resp = client.chat.completions.create(
         model="gpt-4o",
@@ -386,24 +445,64 @@ async def _start_analysis_flow(user, message, context):
                     t(lang, "no_credits"), reply_markup=buy_keyboard(lang))
                 return ConversationHandler.END
 
-    await message.reply_text(t(lang, "ask_shirt"))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "btn_by_color"), callback_data="id_color")],
+        [InlineKeyboardButton(t(lang, "btn_by_position"), callback_data="id_position")],
+        [InlineKeyboardButton(t(lang, "btn_dont_know"), callback_data="id_both")],
+    ])
+    await message.reply_text(t(lang, "ask_identify"), reply_markup=kb)
+    return IDENTIFY
+
+
+async def identify_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь выбрал идентификацию по цвету."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    await q.edit_message_text(t(lang, "ask_shirt"))
     return SHIRT_COLOR
+
+
+async def identify_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь выбрал идентификацию по позиции."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "btn_near"), callback_data="pos_near")],
+        [InlineKeyboardButton(t(lang, "btn_far"), callback_data="pos_far")],
+    ])
+    await q.edit_message_text(t(lang, "ask_position"), reply_markup=kb)
+    return POSITION
+
+
+async def identify_both(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь не знает — анализируем обоих/ближнего."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    context.user_data["identify_mode"] = "both"
+    await q.edit_message_text(t(lang, "ask_video"))
+    return VIDEO
 
 
 async def get_shirt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = db.get_lang(uid)
+    context.user_data["identify_mode"] = "color"
     context.user_data["shirt"] = update.message.text.strip()[:100]
-    await update.message.reply_text(
-        t(lang, "ask_opponent", shirt=context.user_data["shirt"]))
-    return OPPONENT_SHIRT
-
-
-async def get_opponent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    lang = db.get_lang(uid)
-    context.user_data["opponent"] = update.message.text.strip()[:100]
     await update.message.reply_text(t(lang, "ask_video"))
+    return VIDEO
+
+
+async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь выбрал сторону корта."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    context.user_data["identify_mode"] = "position"
+    context.user_data["position"] = "near" if q.data == "pos_near" else "far"
+    await q.edit_message_text(t(lang, "ask_video"))
     return VIDEO
 
 
@@ -411,8 +510,16 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = db.get_lang(uid)
     name = update.effective_user.first_name
-    shirt = context.user_data.get("shirt", "unknown")
-    opp = context.user_data.get("opponent", "unknown")
+
+    # Строим описание как найти игрока — зависит от выбранного режима
+    mode = context.user_data.get("identify_mode", "both")
+    if mode == "color":
+        target_desc = t(lang, "identify_color", shirt=context.user_data.get("shirt", "?"))
+    elif mode == "position":
+        pos_key = "pos_near" if context.user_data.get("position") == "near" else "pos_far"
+        target_desc = t(lang, "identify_position", position=t(lang, pos_key))
+    else:
+        target_desc = t(lang, "identify_both")
 
     if uid in processing_users:
         await update.message.reply_text(t(lang, "busy"))
@@ -449,6 +556,7 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         frames = await loop.run_in_executor(
             None, _extract_frames_sync, video_path, frames_dir)
         if len(frames) < 3:
+            logger.warning("Мало кадров (%d) для user %s", len(frames), uid)
             await msg.edit_text(t(lang, "err_frames"))
             return ConversationHandler.END
 
@@ -465,7 +573,7 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             report = await asyncio.wait_for(
                 loop.run_in_executor(None, _analyze_sync,
-                                     frames, shirt, opp, name, lang),
+                                     frames, target_desc, name, lang),
                 timeout=ANALYSIS_TIMEOUT)
         except asyncio.TimeoutError:
             if not _is_admin(uid):
@@ -636,8 +744,15 @@ def main() -> None:
             CallbackQueryHandler(analyze_entry_btn, pattern="^go_analyze$"),
         ],
         states={
-            SHIRT_COLOR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_shirt)],
-            OPPONENT_SHIRT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_opponent)],
+            IDENTIFY: [
+                CallbackQueryHandler(identify_color, pattern="^id_color$"),
+                CallbackQueryHandler(identify_position, pattern="^id_position$"),
+                CallbackQueryHandler(identify_both, pattern="^id_both$"),
+            ],
+            SHIRT_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_shirt)],
+            POSITION: [
+                CallbackQueryHandler(get_position, pattern="^pos_(near|far)$"),
+            ],
             VIDEO: [
                 MessageHandler(filters.Document.ALL | filters.VIDEO, process_video),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_video),

@@ -40,6 +40,11 @@ MOTION_THRESHOLD = 12
 MAX_FRAMES       = 25
 ANALYSIS_TIMEOUT = 600  # 10 минут максимум на анализ
 MAX_VIDEO_MB     = 200
+ADMIN_ID         = 942577691  # Telegram ID администратора
+
+
+def _is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 SHIRT_COLOR, OPPONENT_SHIRT, VIDEO = range(3)
 
@@ -52,6 +57,16 @@ processing_users: set[int] = set()
 # ==================================================
 # КЛАВИАТУРЫ
 # ==================================================
+
+def _safe_url(url: str) -> str | None:
+    """Возвращает URL только если он валидный http(s), иначе None."""
+    url = (url or "").strip()
+    if url.startswith("http://") or url.startswith("https://"):
+        # Отсекаем мусор вроде пробелов и скобок
+        if " " not in url and "(" not in url:
+            return url
+    return None
+
 def main_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(t(lang, "btn_analyze"), callback_data="go_analyze")],
@@ -60,11 +75,17 @@ def main_keyboard(lang: str) -> InlineKeyboardMarkup:
 
 
 def buy_keyboard(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "btn_5"), url=PAYMENT_LINK_5)],
-        [InlineKeyboardButton(t(lang, "btn_20"), url=PAYMENT_LINK_20)],
-        [InlineKeyboardButton("✅ I paid / Я оплатил", callback_data="paid_5")],
-    ])
+    rows = []
+    url5 = _safe_url(PAYMENT_LINK_5)
+    url20 = _safe_url(PAYMENT_LINK_20)
+    if url5:
+        rows.append([InlineKeyboardButton(t(lang, "btn_5"), url=url5)])
+    if url20:
+        rows.append([InlineKeyboardButton(t(lang, "btn_20"), url=url20)])
+    if not rows:
+        # Платёжные ссылки ещё не настроены — показываем заглушку
+        rows.append([InlineKeyboardButton("⏳ Payment coming soon", callback_data="noop")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ==================================================
@@ -241,6 +262,18 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
             buffer.append(line)
     flush()
 
+    # Дисклеймер
+    pdf.ln(6)
+    pdf.set_font("Roboto", "", 8)
+    pdf.set_text_color(150, 150, 150)
+    disclaimer = {
+        "ru": "Отчёт сгенерирован AI на основе кадров видео и может содержать неточности. Не заменяет очного тренера.",
+        "kz": "Есеп бейне кадрлары негізінде AI арқылы жасалған, дәл болмауы мүмкін. Жаттықтырушыны алмастырмайды.",
+        "en": "This report is AI-generated from video frames and may contain inaccuracies. Not a substitute for a real coach.",
+    }.get(lang, "")
+    pdf.multi_cell(185, 4, disclaimer, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+
     pdf.output(out_path)
     return out_path
 
@@ -342,14 +375,16 @@ async def _start_analysis_flow(user, message, context):
         await message.reply_text(t(lang, "busy"))
         return ConversationHandler.END
 
-    # Бесплатный анализ для новичка, либо проверка баланса
-    if db.get_credits(uid) <= 0:
-        if db.grant_free(uid):
-            pass  # выдали бесплатный
-        else:
-            await message.reply_text(
-                t(lang, "no_credits"), reply_markup=buy_keyboard(lang))
-            return ConversationHandler.END
+    # Админу анализы всегда бесплатны
+    if not _is_admin(uid):
+        # Бесплатный анализ для новичка, либо проверка баланса
+        if db.get_credits(uid) <= 0:
+            if db.grant_free(uid):
+                pass  # выдали бесплатный
+            else:
+                await message.reply_text(
+                    t(lang, "no_credits"), reply_markup=buy_keyboard(lang))
+                return ConversationHandler.END
 
     await message.reply_text(t(lang, "ask_shirt"))
     return SHIRT_COLOR
@@ -417,11 +452,13 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(t(lang, "err_frames"))
             return ConversationHandler.END
 
-        # Списываем кредит ТОЛЬКО когда уверены что анализ пойдёт
-        if not db.consume_credit(uid):
-            await msg.edit_text(t(lang, "no_credits"),
-                                reply_markup=buy_keyboard(lang))
-            return ConversationHandler.END
+        # Списываем кредит ТОЛЬКО когда уверены что анализ пойдёт.
+        # Админ не платит.
+        if not _is_admin(uid):
+            if not db.consume_credit(uid):
+                await msg.edit_text(t(lang, "no_credits"),
+                                    reply_markup=buy_keyboard(lang))
+                return ConversationHandler.END
 
         # AI анализ с таймаутом
         await msg.edit_text(t(lang, "analyzing", n=len(frames)))
@@ -431,7 +468,8 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                      frames, shirt, opp, name, lang),
                 timeout=ANALYSIS_TIMEOUT)
         except asyncio.TimeoutError:
-            db.add_credits(uid, 1)  # вернуть кредит
+            if not _is_admin(uid):
+                db.add_credits(uid, 1)  # вернуть кредит
             await msg.edit_text(t(lang, "err_timeout"))
             return ConversationHandler.END
 
@@ -468,6 +506,108 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         t(lang, "cancelled"), reply_markup=main_keyboard(lang))
     return ConversationHandler.END
+
+
+
+# ==================================================
+# АДМИН-КОМАНДЫ (только для ADMIN_ID)
+# ==================================================
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главная админ-панель."""
+    if not _is_admin(update.effective_user.id):
+        return
+    text = (
+        "🛠 *Админ-панель RallyIQ*\n\n"
+        "/stats — статистика проекта\n"
+        "/users — последние пользователи\n"
+        "/give <user_id> <кол-во> — начислить кредиты\n"
+        "/giveme <кол-во> — начислить себе\n\n"
+        "Ты администратор — все анализы бесплатны."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        return
+    s = db.get_stats()
+    text = (
+        "📊 *Статистика RallyIQ*\n\n"
+        f"👥 Всего пользователей: {s['total_users']}\n"
+        f"🎬 Всего анализов: {s['total_analyses']}\n"
+        f"💳 Кредитов на балансах: {s['total_credits']}\n"
+        f"🔥 Анализов за 7 дней: {s['active_week']}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        return
+    users = db.get_recent_users(15)
+    if not users:
+        await update.message.reply_text("Пока нет пользователей.")
+        return
+    lines = ["👥 *Последние пользователи:*\n"]
+    for u in users:
+        uname = f"@{u['username']}" if u["username"] else "—"
+        lines.append(
+            f"`{u['user_id']}` {u['first_name'] or ''} {uname}\n"
+            f"   💳 {u['credits']} | 🎬 {u['analyses_count']} | 🌐 {u['lang']}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def admin_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/give <user_id> <amount> — начислить кредиты пользователю."""
+    if not _is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("Использование: /give <user_id> <кол-во>")
+        return
+    try:
+        target_id = int(args[0])
+        amount = int(args[1])
+    except ValueError:
+        await update.message.reply_text("user_id и кол-во должны быть числами.")
+        return
+    new_balance = db.add_credits_by_id(target_id, amount)
+    if new_balance is None:
+        await update.message.reply_text(
+            f"❌ Пользователь {target_id} не найден.\n"
+            "Он должен сначала написать /start боту."
+        )
+        return
+    await update.message.reply_text(
+        f"✅ Начислено {amount} анализов пользователю {target_id}.\n"
+        f"Новый баланс: {new_balance}"
+    )
+    # Уведомляем пользователя
+    try:
+        await context.bot.send_message(
+            target_id,
+            f"🎁 Тебе начислено {amount} анализов! Баланс: {new_balance}"
+        )
+    except Exception:
+        pass
+
+
+async def admin_giveme(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/giveme <amount> — начислить себе."""
+    if not _is_admin(update.effective_user.id):
+        return
+    args = context.args
+    amount = int(args[0]) if args and args[0].isdigit() else 10
+    db.ensure_user(update.effective_user.id, update.effective_user.username,
+                   update.effective_user.first_name)
+    new_balance = db.add_credits_by_id(update.effective_user.id, amount)
+    await update.message.reply_text(f"✅ Начислено {amount}. Баланс: {new_balance}")
+
+
+async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заглушка для неактивных кнопок."""
+    await update.callback_query.answer("Скоро будет доступно", show_alert=False)
 
 
 # ==================================================
@@ -511,10 +651,17 @@ def main() -> None:
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("free", free_analysis))
     app.add_handler(CommandHandler("balance", balance))
+    # Админские команды
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("users", admin_users))
+    app.add_handler(CommandHandler("give", admin_give))
+    app.add_handler(CommandHandler("giveme", admin_giveme))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(lang_callback, pattern="^lang_"))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^go_buy$"))
     app.add_handler(CallbackQueryHandler(paid_callback, pattern="^paid_5$"))
+    app.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
 
     logger.info("RallyIQ запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

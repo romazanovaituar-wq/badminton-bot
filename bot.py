@@ -108,7 +108,7 @@ def _download_video_sync(url: str, dest_path: str) -> bool:
         return _download_gdrive(url, dest_path)
 
     ydl_opts = {
-        "format": "best[height<=480]/best",
+        "format": "best[ext=mp4]/best",
         "outtmpl": dest_path,
         "noplaylist": True,
         "max_filesize": MAX_VIDEO_MB * 1024 * 1024,
@@ -127,23 +127,61 @@ def _download_video_sync(url: str, dest_path: str) -> bool:
 
 
 def _download_gdrive(url: str, dest_path: str) -> bool:
-    """Скачивает файл с Google Drive по публичной ссылке."""
+    """
+    Скачивает файл с Google Drive, обходя страницу подтверждения
+    антивирусной проверки (которая возникает для больших файлов).
+    Использует сессию с куками и токеном подтверждения.
+    """
     import re
-    import urllib.request
-    # Извлекаем file id из разных форматов ссылок
+    import requests
+
     m = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"id=([a-zA-Z0-9_-]+)", url)
     if not m:
+        logger.error("Не удалось извлечь file_id из ссылки Google Drive")
         return False
     file_id = m.group(1)
-    direct = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    base = "https://drive.google.com/uc?export=download"
+    session = requests.Session()
+    headers = {"User-Agent": "Mozilla/5.0"}
+
     try:
-        req = urllib.request.Request(direct, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=300) as resp, open(dest_path, "wb") as out:
-            out.write(resp.read())
+        resp = session.get(base, params={"id": file_id}, headers=headers,
+                           stream=True, timeout=300)
+
+        # Ищем токен подтверждения (для больших файлов Google требует подтверждение)
+        token = None
+        for key, value in resp.cookies.items():
+            if key.startswith("download_warning"):
+                token = value
+        if not token:
+            # Новый формат — токен в HTML теле
+            m2 = re.search(r'confirm=([0-9A-Za-z_-]+)', resp.text)
+            if m2:
+                token = m2.group(1)
+
+        if token:
+            resp = session.get(base, params={"id": file_id, "confirm": token},
+                              headers=headers, stream=True, timeout=300)
+
+        # Проверяем что это не HTML страница
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" in content_type:
+            logger.error("Google Drive вернул HTML вместо файла — проверь доступ к ссылке")
+            return False
+
+        with open(dest_path, "wb") as out:
+            for chunk in resp.iter_content(chunk_size=32768):
+                if chunk:
+                    out.write(chunk)
     except Exception as e:
         logger.error("Google Drive ошибка: %s", e)
         return False
-    return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+
+    ok = os.path.exists(dest_path) and os.path.getsize(dest_path) > 10000
+    if not ok:
+        logger.error("Google Drive: файл слишком мал или пуст")
+    return ok
 
 
 def _save_frame(frame, output_dir: str, index: int, time_s: float) -> dict:

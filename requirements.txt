@@ -7,3 +7,4 @@ yt-dlp==2025.1.26
 httpx==0.25.2
 psycopg2-binary==2.9.9
 requests==2.32.3
+gdown==5.2.0

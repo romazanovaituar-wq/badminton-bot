@@ -92,13 +92,58 @@ def buy_keyboard(lang: str) -> InlineKeyboardMarkup:
 # ВИДЕО: скачивание и нарезка (выполняются в executor)
 # ==================================================
 def _download_video_sync(url: str, dest_path: str) -> bool:
-    import subprocess
-    subprocess.run(
-        ["yt-dlp", "-f", "best[height<=480]", "-o", dest_path,
-         "--no-playlist", "--max-filesize", f"{MAX_VIDEO_MB}M", url],
-        capture_output=True, text=True, timeout=300,
-    )
+    """
+    Скачивает видео через Python-модуль yt-dlp (надёжнее чем subprocess,
+    т.к. не зависит от наличия бинарника в PATH).
+    Поддерживает YouTube, Google Drive и прямые ссылки.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        logger.error("yt-dlp не установлен")
+        return False
+
+    # Google Drive ссылки обрабатываем отдельно через gdown-подобную логику
+    if "drive.google.com" in url:
+        return _download_gdrive(url, dest_path)
+
+    ydl_opts = {
+        "format": "best[height<=480]/best",
+        "outtmpl": dest_path,
+        "noplaylist": True,
+        "max_filesize": MAX_VIDEO_MB * 1024 * 1024,
+        "quiet": True,
+        "no_warnings": True,
+        # Обход части блокировок YouTube для серверов
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        logger.error("yt-dlp ошибка: %s", e)
+        return False
     return os.path.exists(dest_path)
+
+
+def _download_gdrive(url: str, dest_path: str) -> bool:
+    """Скачивает файл с Google Drive по публичной ссылке."""
+    import re
+    import urllib.request
+    # Извлекаем file id из разных форматов ссылок
+    m = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"id=([a-zA-Z0-9_-]+)", url)
+    if not m:
+        return False
+    file_id = m.group(1)
+    direct = f"https://drive.google.com/uc?export=download&id={file_id}"
+    try:
+        req = urllib.request.Request(direct, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=300) as resp, open(dest_path, "wb") as out:
+            out.write(resp.read())
+    except Exception as e:
+        logger.error("Google Drive ошибка: %s", e)
+        return False
+    return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
 
 
 def _save_frame(frame, output_dir: str, index: int, time_s: float) -> dict:
@@ -721,6 +766,12 @@ async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================================================
 # ЗАПУСК
 # ==================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Логирует все необработанные ошибки вместо краша."""
+    logger.error("Необработанная ошибка: %s", context.error, exc_info=context.error)
+
+
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         ("analyze", "🏸 Analyze video"),
@@ -778,6 +829,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(paid_callback, pattern="^paid_5$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
 
+    app.add_error_handler(error_handler)
     logger.info("RallyIQ запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

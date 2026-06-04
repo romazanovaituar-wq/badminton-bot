@@ -1,4 +1,4 @@
-python-telegram-bot==21.3
+python-telegram-bot==20.7
 openai==1.55.3
 opencv-python-headless==4.8.1.78
 numpy==1.26.4

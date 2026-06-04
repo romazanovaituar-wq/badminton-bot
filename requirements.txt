@@ -1,7 +1,6 @@
-python-telegram-bot==20.7
-openai==1.55.3
-opencv-python-headless==4.8.1.78
-numpy==1.26.4
-fpdf2==2.7.9
-yt-dlp==2024.3.10
-httpx==0.25.2
+python-telegram-bot
+openai
+opencv-python-headless
+numpy
+fpdf2
+yt-dlp

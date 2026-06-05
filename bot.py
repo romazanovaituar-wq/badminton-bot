@@ -73,7 +73,7 @@ def menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
         [
             [KeyboardButton(t(lang, "menu_analyze")), KeyboardButton(t(lang, "menu_buy"))],
             [KeyboardButton(t(lang, "menu_balance")), KeyboardButton(t(lang, "menu_language"))],
-            [KeyboardButton(t(lang, "menu_help"))],
+            [KeyboardButton(t(lang, "menu_faq"))],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -428,7 +428,7 @@ async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     credits = db.get_credits(q.from_user.id)
     await q.edit_message_text(
         t(lang, "welcome", name=q.from_user.first_name, credits=credits))
-    await q.message.reply_text(t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
+    await q.message.reply_text(t(lang, "onboarding"), reply_markup=menu_keyboard(lang))
 
 
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -818,10 +818,49 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await balance(update, context)
     if text in (TEXTS["ru"]["menu_language"], TEXTS["kz"]["menu_language"], TEXTS["en"]["menu_language"]):
         return await language_command(update, context)
-    if text in (TEXTS["ru"]["menu_help"], TEXTS["kz"]["menu_help"], TEXTS["en"]["menu_help"]):
-        return await help_command(update, context)
+    if text in (TEXTS["ru"]["menu_faq"], TEXTS["kz"]["menu_faq"], TEXTS["en"]["menu_faq"]):
+        return await faq_command(update, context)
     # Не кнопка меню — игнорируем (или подсказываем)
     await update.message.reply_text(t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
+
+
+async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает FAQ с разделами."""
+    lang = db.get_lang(update.effective_user.id)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "faq_btn_drive"), callback_data="faq_drive")],
+        [InlineKeyboardButton(t(lang, "faq_btn_video"), callback_data="faq_video")],
+        [InlineKeyboardButton(t(lang, "faq_btn_how"), callback_data="faq_how")],
+        [InlineKeyboardButton(t(lang, "faq_btn_time"), callback_data="faq_time")],
+    ])
+    await update.message.reply_text(t(lang, "faq_main"), reply_markup=kb)
+
+
+async def faq_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает конкретный раздел FAQ."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    section = q.data.replace("faq_", "")  # drive/video/how/time
+    text = t(lang, f"faq_{section}")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "faq_btn_back"), callback_data="faq_back")],
+    ])
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def faq_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат к списку разделов FAQ."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "faq_btn_drive"), callback_data="faq_drive")],
+        [InlineKeyboardButton(t(lang, "faq_btn_video"), callback_data="faq_video")],
+        [InlineKeyboardButton(t(lang, "faq_btn_how"), callback_data="faq_how")],
+        [InlineKeyboardButton(t(lang, "faq_btn_time"), callback_data="faq_time")],
+    ])
+    await q.edit_message_text(t(lang, "faq_main"), reply_markup=kb)
 
 
 # ==================================================
@@ -898,6 +937,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^go_buy$"))
     app.add_handler(CallbackQueryHandler(paid_callback, pattern="^paid_5$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
+    app.add_handler(CallbackQueryHandler(faq_back, pattern="^faq_back$"))
+    app.add_handler(CallbackQueryHandler(faq_section, pattern="^faq_(drive|video|how|time)$"))
 
     app.add_error_handler(error_handler)
     logger.info("RallyIQ запущен")

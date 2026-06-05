@@ -256,3 +256,23 @@ def take_credits_by_id(user_id: int, amount: int) -> int | None:
             """, (amount, user_id))
             row = cur.fetchone()
             return row[0] if row else None
+
+
+def log_payment(user_id: int, stars: int, credits: int, charge_id: str) -> None:
+    """Логирует успешный платёж Telegram Stars."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     BIGINT,
+                    stars       INTEGER,
+                    credits     INTEGER,
+                    charge_id   TEXT,
+                    created_at  TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                INSERT INTO payments (user_id, stars, credits, charge_id)
+                VALUES (%s, %s, %s, %s);
+            """, (user_id, stars, credits, charge_id))

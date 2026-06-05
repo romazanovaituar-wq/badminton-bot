@@ -11,10 +11,11 @@ import shutil
 from datetime import datetime
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove)
+                      ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+                      LabeledPrice)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes,
-                          filters, ConversationHandler)
+                          filters, ConversationHandler, PreCheckoutQueryHandler)
 from openai import OpenAI
 from fpdf import FPDF
 import cv2
@@ -33,8 +34,12 @@ logger = logging.getLogger("rallyiq")
 
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
-PAYMENT_LINK_5  = os.environ.get("PAYMENT_LINK_5", "https://example.com/5")
-PAYMENT_LINK_20 = os.environ.get("PAYMENT_LINK_20", "https://example.com/20")
+# Пакеты оплаты в Telegram Stars (XTR): payload -> (звёзды, кредиты, название)
+STAR_PACKAGES = {
+    "pack_1":  {"stars": 75,   "credits": 1,  "title": "1 анализ"},
+    "pack_5":  {"stars": 300,  "credits": 5,  "title": "5 анализов"},
+    "pack_20": {"stars": 1000, "credits": 20, "title": "20 анализов"},
+}
 
 MOTION_THRESHOLD = 12
 MAX_FRAMES       = 25
@@ -88,17 +93,18 @@ def main_keyboard(lang: str) -> InlineKeyboardMarkup:
 
 
 def buy_keyboard(lang: str) -> InlineKeyboardMarkup:
-    rows = []
-    url5 = _safe_url(PAYMENT_LINK_5)
-    url20 = _safe_url(PAYMENT_LINK_20)
-    if url5:
-        rows.append([InlineKeyboardButton(t(lang, "btn_5"), url=url5)])
-    if url20:
-        rows.append([InlineKeyboardButton(t(lang, "btn_20"), url=url20)])
-    if not rows:
-        # Платёжные ссылки ещё не настроены — показываем заглушку
-        rows.append([InlineKeyboardButton("⏳ Payment coming soon", callback_data="noop")])
-    return InlineKeyboardMarkup(rows)
+    """Кнопки выбора пакета — каждая запускает выставление счёта в Stars."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"⭐ {STAR_PACKAGES['pack_1']['stars']} — {t(lang, 'pack_1')}",
+            callback_data="buy_pack_1")],
+        [InlineKeyboardButton(
+            f"⭐ {STAR_PACKAGES['pack_5']['stars']} — {t(lang, 'pack_5')}",
+            callback_data="buy_pack_5")],
+        [InlineKeyboardButton(
+            f"⭐ {STAR_PACKAGES['pack_20']['stars']} — {t(lang, 'pack_20')}",
+            callback_data="buy_pack_20")],
+    ])
 
 
 # ==================================================
@@ -520,12 +526,54 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(t(lang, "buy_text"), reply_markup=buy_keyboard(lang))
 
 
-async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь выбрал пакет — выставляем счёт в Telegram Stars."""
     q = update.callback_query
     await q.answer()
     lang = db.get_lang(q.from_user.id)
-    new_balance = db.add_credits(q.from_user.id, 5)
-    await q.edit_message_text(t(lang, "paid_ok", credits=new_balance))
+    payload = q.data.replace("buy_", "")  # pack_1 / pack_5 / pack_20
+    pack = STAR_PACKAGES.get(payload)
+    if not pack:
+        return
+    # Счёт в Stars: provider_token пустой, валюта XTR
+    await context.bot.send_invoice(
+        chat_id=q.from_user.id,
+        title=t(lang, "invoice_title", credits=pack["credits"]),
+        description=t(lang, "invoice_desc", credits=pack["credits"]),
+        payload=payload,
+        provider_token="",          # для Stars — пусто
+        currency="XTR",
+        prices=[LabeledPrice(t(lang, "invoice_label"), pack["stars"])],
+    )
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждаем счёт перед оплатой (обязательный шаг Telegram)."""
+    query = update.pre_checkout_query
+    if query.invoice_payload in STAR_PACKAGES:
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Unknown package")
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Платёж прошёл — начисляем кредиты и логируем."""
+    uid = update.effective_user.id
+    lang = db.get_lang(uid)
+    payment = update.message.successful_payment
+    payload = payment.invoice_payload
+    pack = STAR_PACKAGES.get(payload)
+    if not pack:
+        return
+    new_balance = db.add_credits(uid, pack["credits"])
+    db.log_payment(uid, pack["stars"], pack["credits"],
+                   payment.telegram_payment_charge_id)
+    await update.message.reply_text(
+        t(lang, "payment_ok", credits=pack["credits"], balance=new_balance),
+        reply_markup=menu_keyboard(lang),
+    )
+    logger.info("Оплата: user %s, %d звёзд, +%d кредитов",
+                uid, pack["stars"], pack["credits"])
 
 
 async def free_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1037,7 +1085,10 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
     app.add_handler(CallbackQueryHandler(lang_callback, pattern="^lang_"))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^go_buy$"))
-    app.add_handler(CallbackQueryHandler(paid_callback, pattern="^paid_5$"))
+    # Оплата через Telegram Stars
+    app.add_handler(CallbackQueryHandler(send_invoice_callback, pattern="^buy_pack_"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
     app.add_handler(CallbackQueryHandler(faq_back, pattern="^faq_back$"))
     app.add_handler(CallbackQueryHandler(faq_section, pattern="^faq_(drive|video|how|time)$"))

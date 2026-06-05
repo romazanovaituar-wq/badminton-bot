@@ -322,6 +322,7 @@ def _analyze_sync(frames: list[dict], target: str,
                   name: str, lang: str) -> str:
     frame_prompt = t(lang, "frame_prompt", target=target)
     descriptions: list[str] = []
+    not_found_count = 0
 
     for i, frame in enumerate(frames):
         resp = client.chat.completions.create(
@@ -337,14 +338,22 @@ def _analyze_sync(frames: list[dict], target: str,
         )
         desc = resp.choices[0].message.content or ""
         up = desc.upper()
-        # Пропускаем кадры где игрок не найден
-        if "TARGET_NOT_FOUND" not in up and "NOT VISIBLE" not in up:
+        if "TARGET_NOT_FOUND" in up:
+            not_found_count += 1
+        elif "NOT VISIBLE" in up:
+            pass  # в этом кадре не видно — нормально, просто пропускаем
+        else:
             descriptions.append(f"Frame {i+1} ({frame['time']:.0f}s): {desc}")
 
-    # Если игрок не найден ВООБЩЕ ни в одном кадре — честно говорим что его нет.
-    # Если найден хотя бы в паре кадров — анализируем (мягкий порог,
-    # чтобы не резать реальные видео из-за пары промахов GPT).
-    if len(descriptions) < 2:
+    # Отказываем ТОЛЬКО если игрок реально отсутствует: GPT явно сказал
+    # "не тот игрок" в большинстве кадров И почти ничего полезного не нашлось.
+    # Так мы не режем реальные видео где игрок просто не в каждом кадре.
+    total = len(frames)
+    if not_found_count >= total * 0.6 and len(descriptions) < 2:
+        return "TARGET_NOT_FOUND"
+
+    # Если совсем ничего не описано (например все кадры пустые) — тоже отказ
+    if not descriptions:
         return "TARGET_NOT_FOUND"
 
     report_prompt = t(lang, "report_prompt",
@@ -380,6 +389,9 @@ def _ensure_fonts() -> None:
 def _section_color(title: str) -> tuple:
     """Возвращает цвет акцента для секции по ключевым словам (RU/KZ/EN)."""
     t_low = title.lower()
+    # Приоритет №1 — красный (привлекает внимание к главному)
+    if any(w in t_low for w in ["приоритет", "басымдық", "priority"]):
+        return (255, 90, 90)
     # Сильные стороны — бирюзовый/зелёный
     if any(w in t_low for w in ["сильн", "күшті", "strength"]):
         return (0, 200, 150)
@@ -389,9 +401,15 @@ def _section_color(title: str) -> tuple:
     # Тактика — голубой
     if any(w in t_low for w in ["тактик", "tactic"]):
         return (80, 170, 255)
+    # Твой уровень — светло-голубой
+    if any(w in t_low for w in ["уровень", "деңгей", "level"]):
+        return (120, 200, 255)
     # Упражнения — фиолетовый
     if any(w in t_low for w in ["упражнен", "жаттығу", "drill"]):
         return (180, 130, 255)
+    # План на неделю — золотой
+    if any(w in t_low for w in ["план", "жоспар", "plan"]):
+        return (240, 190, 90)
     # Итог — золотой
     if any(w in t_low for w in ["итог", "қорытынд", "summary"]):
         return (240, 190, 90)

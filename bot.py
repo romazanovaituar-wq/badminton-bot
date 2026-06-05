@@ -11,7 +11,7 @@ import shutil
 from datetime import datetime
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReplyKeyboardRemove)
+                      ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes,
                           filters, ConversationHandler)
@@ -66,6 +66,19 @@ def _safe_url(url: str) -> str | None:
         if " " not in url and "(" not in url:
             return url
     return None
+
+def menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    """Постоянное меню внизу экрана — всегда видно, не нужно помнить команды."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(t(lang, "menu_analyze")), KeyboardButton(t(lang, "menu_buy"))],
+            [KeyboardButton(t(lang, "menu_balance")), KeyboardButton(t(lang, "menu_language"))],
+            [KeyboardButton(t(lang, "menu_help"))],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
 
 def main_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -415,7 +428,19 @@ async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     credits = db.get_credits(q.from_user.id)
     await q.edit_message_text(
         t(lang, "welcome", name=q.from_user.first_name, credits=credits))
-    await q.message.reply_text("👇", reply_markup=main_keyboard(lang))
+    await q.message.reply_text(t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
+
+
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Позволяет сменить язык в любой момент."""
+    u = update.effective_user
+    db.ensure_user(u.id, u.username, u.first_name)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
+        [InlineKeyboardButton("🇰🇿 Қазақша", callback_data="lang_kz")],
+        [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
+    ])
+    await update.message.reply_text(TEXTS["ru"]["choose_lang"], reply_markup=keyboard)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,7 +453,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = db.get_lang(uid)
     await update.message.reply_text(
         t(lang, "balance", credits=db.get_credits(uid)),
-        reply_markup=main_keyboard(lang))
+        reply_markup=menu_keyboard(lang))
 
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -458,7 +483,7 @@ async def free_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.ensure_user(uid, update.effective_user.username, update.effective_user.first_name)
     if db.grant_free(uid):
         await update.message.reply_text(
-            t(lang, "free_ok"), reply_markup=main_keyboard(lang))
+            t(lang, "free_ok"), reply_markup=menu_keyboard(lang))
     else:
         await update.message.reply_text(
             t(lang, "free_used"), reply_markup=buy_keyboard(lang))
@@ -647,7 +672,7 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 document=f,
                 filename=f"RallyIQ_{name}_{datetime.now().strftime('%d%m%Y')}.pdf",
                 caption=t(lang, "done", name=name, credits=remaining),
-                reply_markup=main_keyboard(lang),
+                reply_markup=menu_keyboard(lang),
             )
         await msg.delete()
 
@@ -664,7 +689,7 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = db.get_lang(update.effective_user.id)
     await update.message.reply_text(
-        t(lang, "cancelled"), reply_markup=main_keyboard(lang))
+        t(lang, "cancelled"), reply_markup=menu_keyboard(lang))
     return ConversationHandler.END
 
 
@@ -770,6 +795,30 @@ async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("Скоро будет доступно", show_alert=False)
 
 
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ловит нажатия кнопок постоянного меню (текст) и направляет в нужный handler.
+    Работает на всех языках — сравнивает с локализованными подписями кнопок.
+    """
+    uid = update.effective_user.id
+    lang = db.get_lang(uid)
+    text = (update.message.text or "").strip()
+
+    # Сопоставляем нажатую кнопку с действием на любом из языков
+    if text in (TEXTS["ru"]["menu_analyze"], TEXTS["kz"]["menu_analyze"], TEXTS["en"]["menu_analyze"]):
+        return await analyze_entry_cmd(update, context)
+    if text in (TEXTS["ru"]["menu_buy"], TEXTS["kz"]["menu_buy"], TEXTS["en"]["menu_buy"]):
+        return await buy(update, context)
+    if text in (TEXTS["ru"]["menu_balance"], TEXTS["kz"]["menu_balance"], TEXTS["en"]["menu_balance"]):
+        return await balance(update, context)
+    if text in (TEXTS["ru"]["menu_language"], TEXTS["kz"]["menu_language"], TEXTS["en"]["menu_language"]):
+        return await language_command(update, context)
+    if text in (TEXTS["ru"]["menu_help"], TEXTS["kz"]["menu_help"], TEXTS["en"]["menu_help"]):
+        return await help_command(update, context)
+    # Не кнопка меню — игнорируем (или подсказываем)
+    await update.message.reply_text(t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
+
+
 # ==================================================
 # ЗАПУСК
 # ==================================================
@@ -785,6 +834,7 @@ async def post_init(app: Application) -> None:
         ("buy", "💳 Buy analyses"),
         ("free", "🎁 Free analysis"),
         ("balance", "💰 My balance"),
+        ("language", "🌐 Change language"),
         ("help", "❓ Help"),
     ])
     logger.info("Команды меню установлены")
@@ -800,6 +850,11 @@ def main() -> None:
         entry_points=[
             CommandHandler("analyze", analyze_entry_cmd),
             CallbackQueryHandler(analyze_entry_btn, pattern="^go_analyze$"),
+            # Кнопка "Анализ" в постоянном меню (на всех языках)
+            MessageHandler(
+                filters.Regex(f"^({TEXTS['ru']['menu_analyze']}|{TEXTS['kz']['menu_analyze']}|{TEXTS['en']['menu_analyze']})$"),
+                analyze_entry_cmd,
+            ),
         ],
         states={
             IDENTIFY: [
@@ -821,6 +876,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("free", free_analysis))
     app.add_handler(CommandHandler("balance", balance))
@@ -831,6 +887,8 @@ def main() -> None:
     app.add_handler(CommandHandler("give", admin_give))
     app.add_handler(CommandHandler("giveme", admin_giveme))
     app.add_handler(conv)
+    # Роутер кнопок меню — ловит buy/balance/language/help вне диалога
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
     app.add_handler(CallbackQueryHandler(lang_callback, pattern="^lang_"))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^go_buy$"))
     app.add_handler(CallbackQueryHandler(paid_callback, pattern="^paid_5$"))

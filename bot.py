@@ -335,10 +335,10 @@ def _analyze_sync(frames: list[dict], target: str,
         if "TARGET_NOT_FOUND" not in up and "NOT VISIBLE" not in up:
             descriptions.append(f"Frame {i+1} ({frame['time']:.0f}s): {desc}")
 
-    # Если игрок найден меньше чем в 3 кадрах из всех — считаем что
-    # указанного игрока на видео нет. Честно говорим, а не выдумываем.
-    found_ratio = len(descriptions) / max(len(frames), 1)
-    if len(descriptions) < 3 or found_ratio < 0.25:
+    # Если игрок не найден ВООБЩЕ ни в одном кадре — честно говорим что его нет.
+    # Если найден хотя бы в паре кадров — анализируем (мягкий порог,
+    # чтобы не резать реальные видео из-за пары промахов GPT).
+    if len(descriptions) < 2:
         return "TARGET_NOT_FOUND"
 
     report_prompt = t(lang, "report_prompt",
@@ -706,8 +706,9 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Админ не платит.
         if not _is_admin(uid):
             if not db.consume_credit(uid):
-                await msg.edit_text(t(lang, "no_credits"),
-                                    reply_markup=buy_keyboard(lang))
+                await msg.edit_text(t(lang, "no_credits"))
+                await update.message.reply_text(
+                    t(lang, "buy_text"), reply_markup=buy_keyboard(lang))
                 return ConversationHandler.END
 
         # AI анализ с таймаутом
@@ -728,8 +729,9 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if report == "TARGET_NOT_FOUND":
             if not _is_admin(uid):
                 db.add_credits(uid, 1)
-            await msg.edit_text(t(lang, "err_target_not_found"),
-                                reply_markup=menu_keyboard(lang))
+            await msg.edit_text(t(lang, "err_target_not_found"))
+            await update.message.reply_text(
+                t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
             return ConversationHandler.END
 
         # PDF
@@ -780,6 +782,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats — статистика проекта\n"
         "/users — последние пользователи\n"
         "/give user_id кол-во — начислить кредиты\n"
+        "/take user_id кол-во — забрать кредиты\n"
         "/giveme кол-во — начислить себе\n\n"
         "Ты администратор — все анализы бесплатны."
     )
@@ -847,6 +850,37 @@ async def admin_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             target_id,
             f"🎁 Тебе начислено {amount} анализов! Баланс: {new_balance}"
+        )
+    except Exception:
+        pass
+
+
+async def admin_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/take <user_id> <amount> — забрать кредиты (если начислил по ошибке)."""
+    if not _is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("Использование: /take <user_id> <кол-во>")
+        return
+    try:
+        target_id = int(args[0])
+        amount = int(args[1])
+    except ValueError:
+        await update.message.reply_text("user_id и кол-во должны быть числами.")
+        return
+    new_balance = db.take_credits_by_id(target_id, amount)
+    if new_balance is None:
+        await update.message.reply_text(f"❌ Пользователь {target_id} не найден.")
+        return
+    await update.message.reply_text(
+        f"✅ Списано {amount} анализов у {target_id}.\n"
+        f"Новый баланс: {new_balance}"
+    )
+    try:
+        await context.bot.send_message(
+            target_id,
+            f"⚠️ Баланс изменён. Текущий баланс: {new_balance} анализов."
         )
     except Exception:
         pass
@@ -996,6 +1030,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", admin_stats))
     app.add_handler(CommandHandler("users", admin_users))
     app.add_handler(CommandHandler("give", admin_give))
+    app.add_handler(CommandHandler("take", admin_take))
     app.add_handler(CommandHandler("giveme", admin_giveme))
     app.add_handler(conv)
     # Роутер кнопок меню — ловит buy/balance/language/help вне диалога

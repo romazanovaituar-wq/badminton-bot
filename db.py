@@ -239,3 +239,20 @@ def add_credits_by_id(user_id: int, amount: int) -> int | None:
             """, (amount, user_id))
             row = cur.fetchone()
             return row[0] if row else None
+
+
+def take_credits_by_id(user_id: int, amount: int) -> int | None:
+    """
+    Списывает кредиты у пользователя (для админа — если начислил по ошибке).
+    Не уходит в минус. Возвращает новый баланс или None если юзера нет.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE users
+                SET credits = GREATEST(0, credits - %s)
+                WHERE user_id = %s
+                RETURNING credits;
+            """, (amount, user_id))
+            row = cur.fetchone()
+            return row[0] if row else None

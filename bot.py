@@ -1,17 +1,10 @@
-"""
-RallyIQ — AI-тренер по бадминтону в Telegram.
-Production-ready версия с PostgreSQL, защитой от блокировок и многоязычностью.
-"""
 import os
-import asyncio
-import logging
 import tempfile
+import subprocess
 import base64
-import shutil
+import urllib.request
 from datetime import datetime
-
-from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes,
                           filters, ConversationHandler)
@@ -19,931 +12,408 @@ from openai import OpenAI
 from fpdf import FPDF
 import cv2
 
-import db
-from texts import t, TEXTS
-
-# ==================================================
-# КОНФИГУРАЦИЯ
-# ==================================================
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("rallyiq")
-
-BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
-OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
-PAYMENT_LINK_5  = os.environ.get("PAYMENT_LINK_5", "https://example.com/5")
-PAYMENT_LINK_20 = os.environ.get("PAYMENT_LINK_20", "https://example.com/20")
+BOT_TOKEN       = os.environ.get('BOT_TOKEN', '')
+OPENAI_API_KEY  = os.environ.get('OPENAI_API_KEY', '')
+PAYMENT_LINK_5  = os.environ.get('PAYMENT_LINK_5', 'https://your-lemonsqueezy.com/5pack')
+PAYMENT_LINK_20 = os.environ.get('PAYMENT_LINK_20', 'https://your-lemonsqueezy.com/20pack')
 
 MOTION_THRESHOLD = 12
-MAX_FRAMES       = 25
-ANALYSIS_TIMEOUT = 600  # 10 минут максимум на анализ
-MAX_VIDEO_MB     = 200
-ADMIN_ID         = 942577691  # Telegram ID администратора
+MAX_FRAMES = 25
+LANG, SHIRT_COLOR, OPPONENT_SHIRT, VIDEO = range(4)
 
-
-def _is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-IDENTIFY, SHIRT_COLOR, POSITION, VIDEO = range(4)
-
+user_credits = {}
+user_lang = {}
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Защита от двойного запуска: кто сейчас обрабатывает видео
-processing_users: set[int] = set()
-
-
-# ==================================================
-# КЛАВИАТУРЫ
-# ==================================================
-
-def _safe_url(url: str) -> str | None:
-    """Возвращает URL только если он валидный http(s), иначе None."""
-    url = (url or "").strip()
-    if url.startswith("http://") or url.startswith("https://"):
-        # Отсекаем мусор вроде пробелов и скобок
-        if " " not in url and "(" not in url:
-            return url
-    return None
-
-def menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
-    """Постоянное меню внизу экрана — всегда видно, не нужно помнить команды."""
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(t(lang, "menu_analyze")), KeyboardButton(t(lang, "menu_buy"))],
-            [KeyboardButton(t(lang, "menu_balance")), KeyboardButton(t(lang, "menu_language"))],
-            [KeyboardButton(t(lang, "menu_faq"))],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-
-def main_keyboard(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "btn_analyze"), callback_data="go_analyze")],
-        [InlineKeyboardButton(t(lang, "btn_buy"), callback_data="go_buy")],
-    ])
-
-
-def buy_keyboard(lang: str) -> InlineKeyboardMarkup:
-    rows = []
-    url5 = _safe_url(PAYMENT_LINK_5)
-    url20 = _safe_url(PAYMENT_LINK_20)
-    if url5:
-        rows.append([InlineKeyboardButton(t(lang, "btn_5"), url=url5)])
-    if url20:
-        rows.append([InlineKeyboardButton(t(lang, "btn_20"), url=url20)])
-    if not rows:
-        # Платёжные ссылки ещё не настроены — показываем заглушку
-        rows.append([InlineKeyboardButton("⏳ Payment coming soon", callback_data="noop")])
-    return InlineKeyboardMarkup(rows)
-
-
-# ==================================================
-# ВИДЕО: скачивание и нарезка (выполняются в executor)
-# ==================================================
-def _download_video_sync(url: str, dest_path: str) -> bool:
-    """
-    Скачивает видео через Python-модуль yt-dlp (надёжнее чем subprocess,
-    т.к. не зависит от наличия бинарника в PATH).
-    Поддерживает YouTube, Google Drive и прямые ссылки.
-    """
-    try:
-        import yt_dlp
-    except ImportError:
-        logger.error("yt-dlp не установлен")
-        return False
-
-    # Google Drive ссылки обрабатываем отдельно через gdown-подобную логику
-    if "drive.google.com" in url:
-        return _download_gdrive(url, dest_path)
-
-    ydl_opts = {
-        # Гибкий выбор формата с фоллбэками — берём что доступно
-        "format": "mp4/bestvideo[height<=720]+bestaudio/best",
-        "outtmpl": dest_path,
-        "noplaylist": True,
-        "max_filesize": MAX_VIDEO_MB * 1024 * 1024,
-        "quiet": True,
-        "no_warnings": True,
-        "merge_output_format": "mp4",
-        # Несколько client-ов для обхода блокировок YouTube
-        "extractor_args": {
-            "youtube": {"player_client": ["android", "ios", "web", "tv"]}
-        },
+TEXTS = {
+    'ru': {
+        'welcome': "Привет, {name}!\n\nBadminton AI Coach - твой AI-тренер.\n\nЗагружаешь видео -> получаешь разбор:\n- Сильные стороны\n- Технические ошибки\n- Тактика\n- Упражнения\n\nБаланс: {credits} анализов\n\n/free - бесплатный анализ\n/analyze - начать\n/buy - купить пакет",
+        'help': "Как пользоваться:\n1. /free - 1 бесплатный анализ\n2. /analyze - начать анализ\n3. /buy - купить пакет\n\nФорматы видео:\n- Файл до 50МБ\n- Google Drive ссылка\n- YouTube ссылка",
+        'buy_text': "Выбери пакет:\n\n5 анализов - $9.99\n20 анализов - $19.99\n\nПосле оплаты нажми кнопку ниже",
+        'buy_btn_5': "5 анализов - $9.99",
+        'buy_btn_20': "20 анализов - $19.99",
+        'buy_btn_paid': "Я оплатил - добавь анализы",
+        'paid_ok': "Добавлено 5 анализов! Баланс: {credits}\n\n/analyze чтобы начать.",
+        'free_ok': "Бесплатный анализ добавлен!\n\n/analyze чтобы начать.",
+        'free_used': "Бесплатный анализ уже использован.\n\n/buy чтобы купить пакет.",
+        'no_credits': "Нет анализов.\n\n/free - первый раз бесплатно\n/buy - купить пакет",
+        'ask_shirt': "Начинаем!\n\nОпиши свою одежду в видео:\nНапример: красная футболка черные шорты",
+        'ask_opponent': "Понял - {shirt}\n\nОпиши одежду соперника:",
+        'ask_video': "Отлично!\n\nОтправь видео:\n1. Файл до 50МБ\n2. Google Drive ссылка\n3. YouTube ссылка\n\n/cancel - отмена",
+        'processing': "Получил! Анализирую... 5-10 минут",
+        'downloading': "Скачиваю видео...",
+        'extracting': "Извлекаю кадры...",
+        'analyzing': "Анализирую {n} кадров...",
+        'generating': "Генерирую PDF...",
+        'done': "Анализ готов, {name}!\n\nОсталось: {credits} анализов\n\n{next_action}",
+        'buy_more': "Закончились? /buy",
+        'next_analyze': "/analyze - новый анализ",
+        'err_download': "Не смог скачать. Попробуй другую ссылку.",
+        'err_format': "Не понял формат. Отправь файл или ссылку.",
+        'err_frames': "Не удалось извлечь кадры. Попробуй другое видео.",
+        'err_general': "Ошибка. /analyze чтобы начать заново.\n{error}",
+        'cancelled': "Отменено. /analyze чтобы начать заново.",
+        'report_prompt': "Ты опытный тренер по бадминтону.\nПроанализировал {n} кадров. Игрок: {name}, одежда: {shirt}.\n\nКАДРЫ:\n{frames}\n\nНапиши отчёт НА РУССКОМ:\n\n## СИЛЬНЫЕ СТОРОНЫ\n1.\n2.\n3.\n\n## ТЕХНИЧЕСКИЕ ОШИБКИ\n1. [ошибка]: [почему]\n2.\n3.\n\n## ТАКТИКА\n1.\n2.\n\n## УПРАЖНЕНИЯ\n1. [название]: [как делать]\n2.\n3.\n\n## ИТОГ\n[3 предложения]\n\nТолько на основе кадров.",
+        'frame_prompt': "Опиши кадр бадминтона. Только факты. Игрок в {shirt}, игнорируй {opp}.\n- Позиция (сетка/середина/задняя)\n- Удар (смэш/лифт/дроп/нет)\n- Ракетка (высоко/низко)\n- Стойка\n- Ошибка если есть\n2 предложения.",
+    },
+    'kz': {
+        'welcome': "Salem, {name}!\n\nBadminton AI Coach - zheke AI zhattyktyrushy.\n\nBeine jukteysin -> taldau alasyn.\n\nBalans: {credits} taldau\n\n/free - tegіn taldau\n/analyze - bastau\n/buy - paket satyp alu",
+        'help': "Qalai paydalaný kerek:\n1. /free - 1 tegіn taldau\n2. /analyze - taldaý bastau\n3. /buy - paket satyp alu\n\nBeyne formattary:\n- Fail 50MB deyin\n- Google Drive sіltemesi\n- YouTube sіltemesi",
+        'buy_text': "Paket tanda:\n\n5 taldau - $9.99\n20 taldau - $19.99\n\nTolegennен keyin tomengi batyrmanы bas",
+        'buy_btn_5': "5 taldau - $9.99",
+        'buy_btn_20': "20 taldau - $19.99",
+        'buy_btn_paid': "Toledim - taldaulardy qos",
+        'paid_ok': "5 taldau qosyldy! Balans: {credits}\n\n/analyze zhaz.",
+        'free_ok': "Tegіn taldau qosyldy!\n\n/analyze zhaz.",
+        'free_used': "Tegіn taldau buryn paydaanyldý.\n\n/buy zhaz.",
+        'no_credits': "Taldaun zhok.\n\n/free - birіnshі ret tegіn\n/buy - paket satyp alu",
+        'ask_shirt': "Bastaymyz!\n\nOsы beynedegiі kiіmdі sіpatta:\nMysaly: qyzyл futbolka qara short",
+        'ask_opponent': "Tusіndіm - {shirt}\n\nQarsy las kiіmіn sіpatta:",
+        'ask_video': "Keremett!\n\nBeynenі zhiber:\n1. Fail 50MB deyin\n2. Google Drive sіltemesi\n3. YouTube sіltemesi\n\n/cancel - boltyrylmaý",
+        'processing': "Aldym! Taldaymyn... 5-10 minut",
+        'downloading': "Beineni zhukteude...",
+        'extracting': "Kadrlardy shygaruda...",
+        'analyzing': "{n} kadrdy taldauda...",
+        'generating': "PDF zhasalude...",
+        'done': "Taldau dayyn, {name}!\n\nQalgan: {credits} taldau\n\n{next_action}",
+        'buy_more': "Bitті? /buy",
+        'next_analyze': "/analyze - zhana taldau",
+        'err_download': "Zhukteу mumkіn bolmady.",
+        'err_format': "Format tusinіlmedі.",
+        'err_frames': "Kadrlardy shygaru mumkіn bolmady.",
+        'err_general': "Qate. /analyze zhazыp qayta bastan.\n{error}",
+        'cancelled': "Boltyrylmady. /analyze qayta bastan.",
+        'report_prompt': "Sen tazhibelі badminton zhattyktyrushy syn.\nTaldaldy: {n} kadr. Oynaushy: {name}, kiіmі: {shirt}.\n\nKADRLAR:\n{frames}\n\nQAZAQ TІLІNDE esep zhaz:\n\n## KUSHTI ZHAQTARY\n1.\n2.\n3.\n\n## TEHNIKALY QATELER\n1. [qate]: [nege]\n2.\n3.\n\n## TAKTIKA\n1.\n2.\n\n## ZHATTYGULAR\n1. [atauy]: [qalai]\n2.\n3.\n\n## QORYTYNDY\n[3 soilem]\n\nTek kadrlar negіzіnde.",
+        'frame_prompt': "Badminton kadryyn sipatta. Tek faktіler. Oynaushy {shirt} kiіngen, {opp} kiіngendі eleme.\n- Pozitsiya\n- Soqqy\n- Rakettka\n- Turys\n- Qate bar bolsa\n2 soilem.",
+    },
+    'en': {
+        'welcome': "Hello, {name}!\n\nBadminton AI Coach - your personal AI trainer.\n\nUpload match video -> get detailed analysis:\n- Strengths\n- Technical mistakes\n- Tactics\n- Drills\n\nBalance: {credits} analyses\n\n/free - free analysis\n/analyze - start\n/buy - buy package",
+        'help': "How to use:\n1. /free - 1 free analysis\n2. /analyze - start analysis\n3. /buy - buy package\n\nVideo formats:\n- File up to 50MB\n- Google Drive link\n- YouTube link",
+        'buy_text': "Choose package:\n\n5 analyses - $9.99\n20 analyses - $19.99\n\nAfter payment press button below",
+        'buy_btn_5': "5 analyses - $9.99",
+        'buy_btn_20': "20 analyses - $19.99",
+        'buy_btn_paid': "I paid - add analyses",
+        'paid_ok': "5 analyses added! Balance: {credits}\n\nType /analyze to start.",
+        'free_ok': "Free analysis added!\n\nType /analyze to start.",
+        'free_used': "Free analysis already used.\n\nType /buy to purchase.",
+        'no_credits': "No analyses left.\n\n/free - first time free\n/buy - buy package",
+        'ask_shirt': "Let's start!\n\nDescribe your outfit in this video:\nE.g.: red shirt black shorts",
+        'ask_opponent': "Got it - {shirt}\n\nDescribe opponent's outfit:",
+        'ask_video': "Great!\n\nSend your video:\n1. File up to 50MB\n2. Google Drive link\n3. YouTube link\n\n/cancel - cancel",
+        'processing': "Got it! Analyzing... 5-10 minutes",
+        'downloading': "Downloading video...",
+        'extracting': "Extracting frames...",
+        'analyzing': "Analyzing {n} frames...",
+        'generating': "Generating PDF...",
+        'done': "Analysis ready, {name}!\n\nLeft: {credits} analyses\n\n{next_action}",
+        'buy_more': "Out of analyses? /buy",
+        'next_analyze': "/analyze - new analysis",
+        'err_download': "Could not download. Try another link.",
+        'err_format': "Format not recognized. Send file or link.",
+        'err_frames': "Could not extract frames. Try another video.",
+        'err_general': "Error. Type /analyze to start over.\n{error}",
+        'cancelled': "Cancelled. Type /analyze to start over.",
+        'report_prompt': "You are an expert badminton coach.\nAnalyzed {n} frames. Player: {name}, outfit: {shirt}.\n\nFRAMES:\n{frames}\n\nWrite report IN ENGLISH:\n\n## STRENGTHS\n1.\n2.\n3.\n\n## TECHNICAL MISTAKES\n1. [mistake]: [why]\n2.\n3.\n\n## TACTICAL PATTERNS\n1.\n2.\n\n## DRILLS\n1. [name]: [how to do]\n2.\n3.\n\n## SUMMARY\n[3 sentences]\n\nBase on visible frames only.",
+        'frame_prompt': "Describe this badminton frame. Facts only. Focus on player in {shirt}, ignore {opp}.\n- Position (net/mid/baseline)\n- Shot type\n- Racket position\n- Stance\n- Any mistake\n2 sentences.",
     }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        logger.error("yt-dlp ошибка: %s", e)
-        return False
+}
+
+def t(user_id, key, **kwargs):
+    lang = user_lang.get(user_id, 'ru')
+    text = TEXTS[lang].get(key, key)
+    return text.format(**kwargs) if kwargs else text
+
+def download_video(url, dest_path):
+    result = subprocess.run([
+        'yt-dlp', '-f', 'best[height<=480]',
+        '-o', dest_path, '--no-playlist', url
+    ], capture_output=True, text=True)
     return os.path.exists(dest_path)
 
-
-def _download_gdrive(url: str, dest_path: str) -> bool:
-    """
-    Скачивает файл с Google Drive через библиотеку gdown,
-    которая корректно обходит страницу подтверждения для больших файлов.
-    """
-    import re
-    m = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"id=([a-zA-Z0-9_-]+)", url)
-    if not m:
-        logger.error("Не удалось извлечь file_id из ссылки Google Drive")
-        return False
-    file_id = m.group(1)
-    try:
-        import gdown
-        gdown.download(id=file_id, output=dest_path, quiet=True, fuzzy=True)
-    except Exception as e:
-        logger.error("gdown ошибка: %s", e)
-        return False
-    ok = os.path.exists(dest_path) and os.path.getsize(dest_path) > 10000
-    if not ok:
-        logger.error("Google Drive: файл не скачался или слишком мал. "
-                     "Проверь что доступ открыт 'всем у кого есть ссылка'.")
-    return ok
-
-def _save_frame(frame, output_dir: str, index: int, time_s: float) -> dict:
-    """Сохраняет кадр с ресайзом и возвращает метаданные."""
-    h, w = frame.shape[:2]
-    if w > 800:
-        frame = cv2.resize(frame, (800, int(h * 800 / w)))
-    path = f"{output_dir}/frame_{index:03d}.jpg"
-    cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return {"path": path, "time": time_s}
-
-
-def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
-    """
-    Надёжное извлечение кадров с трёхуровневым фоллбэком:
-    1) кадры с движением (умный выбор)
-    2) равномерно по времени (если движения мало)
-    3) любые доступные кадры (если видео короткое/проблемное)
-    Гарантированно не возвращает пустоту если в видео есть кадры.
-    """
+def extract_frames(video_path, output_dir, threshold=12, max_frames=25):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
-    # --- Уровень 1: motion detection ---
-    motion: list[dict] = []
     prev_gray = None
+    saved = []
     idx = 0
-    last_saved = -fps
-    while len(motion) < MAX_FRAMES:
+    last_saved = -30
+    while len(saved) < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
-        if idx % 5 == 0:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (21, 21), 0)
-            if prev_gray is not None:
-                diff = cv2.absdiff(gray, prev_gray).mean()
-                if diff > MOTION_THRESHOLD and (idx - last_saved) > fps:
-                    motion.append(_save_frame(frame, output_dir, len(motion), idx / fps))
-                    last_saved = idx
-            prev_gray = gray
-        idx += 1
-
-    if len(motion) >= 8:
-        cap.release()
-        logger.info("Извлечено %d кадров (motion)", len(motion))
-        return motion
-
-    # --- Уровень 2: равномерно по видео ---
-    # Чистим то что насобирал уровень 1
-    for fobj in motion:
-        try:
-            os.remove(fobj["path"])
-        except OSError:
-            pass
-
-    uniform: list[dict] = []
-    if total > 0:
-        step = max(1, total // MAX_FRAMES)
-        for i in range(0, total, step):
-            if len(uniform) >= MAX_FRAMES:
-                break
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ret, frame = cap.read()
-            if ret:
-                uniform.append(_save_frame(frame, output_dir, len(uniform), i / fps))
-    if len(uniform) >= 3:
-        cap.release()
-        logger.info("Извлечено %d кадров (uniform)", len(uniform))
-        return uniform
-
-    # --- Уровень 3: берём вообще всё что есть ---
-    for fobj in uniform:
-        try:
-            os.remove(fobj["path"])
-        except OSError:
-            pass
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    any_frames: list[dict] = []
-    idx = 0
-    while len(any_frames) < MAX_FRAMES:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if idx % 10 == 0:
-            any_frames.append(_save_frame(frame, output_dir, len(any_frames), idx / fps))
+        if idx % 5 != 0:
+            idx += 1
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+        if prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray).mean()
+            if diff > threshold and (idx - last_saved) > fps:
+                path = f'{output_dir}/frame_{len(saved):03d}.jpg'
+                h, w = frame.shape[:2]
+                if w > 800:
+                    frame = cv2.resize(frame, (800, int(h * 800/w)))
+                cv2.imwrite(path, frame)
+                saved.append({'path': path, 'time': idx / fps})
+                last_saved = idx
+        prev_gray = gray
         idx += 1
     cap.release()
-    logger.info("Извлечено %d кадров (fallback)", len(any_frames))
-    return any_frames
+    return saved
 
+def encode_image(path):
+    with open(path, 'rb') as f:
+        return base64.b64encode(f.read()).decode('utf-8')
 
-# ==================================================
-# AI АНАЛИЗ (выполняется в executor)
-# ==================================================
-def _encode_image(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def _analyze_sync(frames: list[dict], target: str,
-                  name: str, lang: str) -> str:
-    frame_prompt = t(lang, "frame_prompt", target=target)
-    descriptions: list[str] = []
-
+def analyze_video(frames, shirt, opp_shirt, player_name, lang='ru'):
+    frame_prompt = TEXTS[lang]['frame_prompt']
+    report_prompt = TEXTS[lang]['report_prompt']
+    descriptions = []
     for i, frame in enumerate(frames):
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model='gpt-4o-mini',
             max_tokens=150,
-            messages=[{"role": "user", "content": [
-                {"type": "image_url", "image_url": {
-                    "url": f"data:image/jpeg;base64,{_encode_image(frame['path'])}",
-                    "detail": "low",
+            messages=[{'role': 'user', 'content': [
+                {'type': 'image_url', 'image_url': {
+                    'url': f'data:image/jpeg;base64,{encode_image(frame["path"])}',
+                    'detail': 'low'
                 }},
-                {"type": "text", "text": frame_prompt},
-            ]}],
+                {'type': 'text', 'text': frame_prompt.format(shirt=shirt, opp=opp_shirt)}
+            ]}]
         )
         desc = resp.choices[0].message.content
-        if "not visible" not in desc.lower():
-            descriptions.append(f"Frame {i+1} ({frame['time']:.0f}s): {desc}")
-
+        if 'not visible' not in desc.lower():
+            descriptions.append(f'Frame {i+1} ({frame["time"]:.0f}s): {desc}')
     if not descriptions:
-        return "Could not analyze — player not visible in frames."
-
-    report_prompt = t(lang, "report_prompt",
-                      n=len(descriptions), name=name, target=target,
-                      frames="\n".join(descriptions))
+        return "Could not analyze video - player not visible in frames."
     resp = client.chat.completions.create(
-        model="gpt-4o",
+        model='gpt-4o',
         max_tokens=1500,
-        messages=[{"role": "user", "content": report_prompt}],
+        messages=[{'role': 'user', 'content': report_prompt.format(
+            n=len(descriptions),
+            name=player_name,
+            shirt=shirt,
+            frames='\n'.join(descriptions)
+        )}]
     )
     return resp.choices[0].message.content
 
-
-# ==================================================
-# PDF
-# ==================================================
-FONT_REG = "/tmp/Roboto-Regular.ttf"
-FONT_BLD = "/tmp/Roboto-Bold.ttf"
-
-
-def _ensure_fonts() -> None:
-    import urllib.request
-    if not os.path.exists(FONT_REG):
+def download_fonts():
+    if not os.path.exists('/tmp/Roboto-Regular.ttf'):
         urllib.request.urlretrieve(
-            "https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf",
-            FONT_REG)
-    if not os.path.exists(FONT_BLD):
+            'https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf',
+            '/tmp/Roboto-Regular.ttf'
+        )
+    if not os.path.exists('/tmp/Roboto-Bold.ttf'):
         urllib.request.urlretrieve(
-            "https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf",
-            FONT_BLD)
+            'https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf',
+            '/tmp/Roboto-Bold.ttf'
+        )
 
-
-def _generate_pdf_sync(report: str, name: str, frames_count: int,
-                       lang: str, out_path: str) -> str:
-    _ensure_fonts()
+def generate_pdf(report, player_name, frames_count, lang='ru'):
+    download_fonts()
 
     class Report(FPDF):
         def header(self):
-            self.set_font("Roboto", "B", 15)
+            self.set_font('Roboto', 'B', 15)
             self.set_fill_color(20, 60, 140)
             self.set_text_color(255, 255, 255)
-            self.cell(0, 14, "  RALLYIQ — AI BADMINTON COACH",
-                      fill=True, new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 14, '  BADMINTON AI COACH', fill=True, new_x='LMARGIN', new_y='NEXT')
             self.set_text_color(0, 0, 0)
             self.ln(3)
 
         def footer(self):
             self.set_y(-15)
-            self.set_font("Roboto", "", 8)
+            self.set_font('Roboto', '', 8)
             self.set_text_color(150, 150, 150)
-            self.cell(0, 10,
-                      f"RallyIQ | {datetime.now().strftime('%d.%m.%Y')} | Page {self.page_no()}",
-                      align="C")
+            self.cell(0, 10, f'AI Report | {datetime.now().strftime("%d.%m.%Y")} | Page {self.page_no()}', align='C')
 
     pdf = Report()
-    pdf.add_font("Roboto", "", FONT_REG)
-    pdf.add_font("Roboto", "B", FONT_BLD)
+    pdf.add_font('Roboto', '', '/tmp/Roboto-Regular.ttf')
+    pdf.add_font('Roboto', 'B', '/tmp/Roboto-Bold.ttf')
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=20)
-
-    pdf.set_font("Roboto", "", 10)
+    pdf.set_font('Roboto', '', 10)
     pdf.set_fill_color(245, 248, 255)
-    pdf.cell(0, 9,
-             f"  Player: {name}   |   Frames: {frames_count}   |   {datetime.now().strftime('%d.%m.%Y')}",
-             fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 9, f'  Player: {player_name}   |   Frames: {frames_count}   |   {datetime.now().strftime("%d.%m.%Y")}',
+             fill=True, new_x='LMARGIN', new_y='NEXT')
     pdf.ln(5)
 
-    current = None
-    buffer: list[str] = []
+    current_section = None
+    section_lines = []
 
-    def flush():
-        if current and buffer:
+    def flush_section():
+        if current_section and section_lines:
             pdf.ln(3)
-            pdf.set_font("Roboto", "B", 12)
+            pdf.set_font('Roboto', 'B', 12)
             pdf.set_fill_color(220, 230, 255)
             pdf.set_text_color(20, 60, 140)
-            pdf.cell(0, 9, f"  {current}", fill=True,
-                     new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(0, 9, f'  {current_section}', fill=True, new_x='LMARGIN', new_y='NEXT')
             pdf.set_text_color(0, 0, 0)
             pdf.ln(2)
-            for ln in buffer:
-                pdf.set_font("Roboto", "", 10)
-                txt = f"  {ln}" if (ln and ln[0].isdigit()) else ln
-                pdf.multi_cell(185, 6, txt, new_x="LMARGIN", new_y="NEXT")
+            for ln in section_lines:
+                pdf.set_font('Roboto', '', 10)
+                pdf.multi_cell(185, 6, f'  {ln}' if (ln and ln[0].isdigit()) else ln,
+                               new_x='LMARGIN', new_y='NEXT')
                 pdf.ln(1)
 
-    for line in report.split("\n"):
+    for line in report.split('\n'):
         line = line.strip()
         if not line:
             continue
-        if line.startswith("## "):
-            flush()
-            current = line[3:].strip()
-            buffer = []
+        if line.startswith('## '):
+            flush_section()
+            current_section = line[3:].strip()
+            section_lines = []
         else:
-            buffer.append(line)
-    flush()
+            section_lines.append(line)
+    flush_section()
 
-    # Дисклеймер
-    pdf.ln(6)
-    pdf.set_font("Roboto", "", 8)
-    pdf.set_text_color(150, 150, 150)
-    disclaimer = {
-        "ru": "Отчёт сгенерирован AI на основе кадров видео и может содержать неточности. Не заменяет очного тренера.",
-        "kz": "Есеп бейне кадрлары негізінде AI арқылы жасалған, дәл болмауы мүмкін. Жаттықтырушыны алмастырмайды.",
-        "en": "This report is AI-generated from video frames and may contain inaccuracies. Not a substitute for a real coach.",
-    }.get(lang, "")
-    pdf.multi_cell(185, 4, disclaimer, new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(0, 0, 0)
+    path = f'/tmp/report_{player_name}_{datetime.now().strftime("%Y%m%d_%H%M")}.pdf'
+    pdf.output(path)
+    return path
 
-    pdf.output(out_path)
-    return out_path
-
-
-# ==================================================
-# HANDLERS — команды
-# ==================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    db.ensure_user(u.id, u.username, u.first_name)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
-        [InlineKeyboardButton("🇰🇿 Қазақша", callback_data="lang_kz")],
-        [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
-    ])
-    # Убираем застрявшую старую клавиатуру
-    await update.message.reply_text("🏸 RallyIQ", reply_markup=ReplyKeyboardRemove())
+    keyboard = [
+        [InlineKeyboardButton("Русский", callback_data='lang_ru')],
+        [InlineKeyboardButton("Kazaksha", callback_data='lang_kz')],
+        [InlineKeyboardButton("English",  callback_data='lang_en')],
+    ]
     await update.message.reply_text(
-        TEXTS["ru"]["choose_lang"], reply_markup=keyboard)
-
+        "Выберите язык / Tildi tandanyz / Choose language:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    lang = q.data.replace("lang_", "")
-    db.ensure_user(q.from_user.id, q.from_user.username, q.from_user.first_name)
-    db.set_lang(q.from_user.id, lang)
-    credits = db.get_credits(q.from_user.id)
-    await q.edit_message_text(
-        t(lang, "welcome", name=q.from_user.first_name, credits=credits))
-    await q.message.reply_text(t(lang, "onboarding"), reply_markup=menu_keyboard(lang))
-
-
-async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Позволяет сменить язык в любой момент."""
-    u = update.effective_user
-    db.ensure_user(u.id, u.username, u.first_name)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
-        [InlineKeyboardButton("🇰🇿 Қазақша", callback_data="lang_kz")],
-        [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
-    ])
-    await update.message.reply_text(TEXTS["ru"]["choose_lang"], reply_markup=keyboard)
-
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    user_lang[user_id] = query.data.replace('lang_', '')
+    name = query.from_user.first_name
+    credits = user_credits.get(user_id, 0)
+    await query.edit_message_text(t(user_id, 'welcome', name=name, credits=credits))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = db.get_lang(update.effective_user.id)
-    await update.message.reply_text(t(lang, "help"))
-
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    lang = db.get_lang(uid)
-    await update.message.reply_text(
-        t(lang, "balance", credits=db.get_credits(uid)),
-        reply_markup=menu_keyboard(lang))
-
+    await update.message.reply_text(t(update.effective_user.id, 'help'))
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = db.get_lang(update.effective_user.id)
-    await update.message.reply_text(
-        t(lang, "buy_text"), reply_markup=buy_keyboard(lang))
-
-
-async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    await q.message.reply_text(t(lang, "buy_text"), reply_markup=buy_keyboard(lang))
-
+    uid = update.effective_user.id
+    keyboard = [
+        [InlineKeyboardButton(t(uid, 'buy_btn_5'),    url=PAYMENT_LINK_5)],
+        [InlineKeyboardButton(t(uid, 'buy_btn_20'),   url=PAYMENT_LINK_20)],
+        [InlineKeyboardButton(t(uid, 'buy_btn_paid'), callback_data='paid_5')],
+    ]
+    await update.message.reply_text(t(uid, 'buy_text'), reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    new_balance = db.add_credits(q.from_user.id, 5)
-    await q.edit_message_text(t(lang, "paid_ok", credits=new_balance))
-
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    user_credits[uid] = user_credits.get(uid, 0) + 5
+    await query.edit_message_text(t(uid, 'paid_ok', credits=user_credits[uid]))
 
 async def free_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    lang = db.get_lang(uid)
-    db.ensure_user(uid, update.effective_user.username, update.effective_user.first_name)
-    if db.grant_free(uid):
-        await update.message.reply_text(
-            t(lang, "free_ok"), reply_markup=menu_keyboard(lang))
+    if uid not in user_credits:
+        user_credits[uid] = 1
+        await update.message.reply_text(t(uid, 'free_ok'))
     else:
-        await update.message.reply_text(
-            t(lang, "free_used"), reply_markup=buy_keyboard(lang))
+        await update.message.reply_text(t(uid, 'free_used'))
 
-
-# ==================================================
-# HANDLERS — диалог анализа
-# ==================================================
-async def analyze_entry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await _start_analysis_flow(update.effective_user, update.message, context)
-
-
-async def analyze_entry_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    return await _start_analysis_flow(q.from_user, q.message, context)
-
-
-async def _start_analysis_flow(user, message, context):
-    uid = user.id
-    lang = db.get_lang(uid)
-    db.ensure_user(uid, user.username, user.first_name)
-
-    if uid in processing_users:
-        await message.reply_text(t(lang, "busy"))
+async def analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if user_credits.get(uid, 0) <= 0:
+        await update.message.reply_text(t(uid, 'no_credits'))
         return ConversationHandler.END
-
-    # Админу анализы всегда бесплатны
-    if not _is_admin(uid):
-        # Бесплатный анализ для новичка, либо проверка баланса
-        if db.get_credits(uid) <= 0:
-            if db.grant_free(uid):
-                pass  # выдали бесплатный
-            else:
-                await message.reply_text(
-                    t(lang, "no_credits"), reply_markup=buy_keyboard(lang))
-                return ConversationHandler.END
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "btn_by_color"), callback_data="id_color")],
-        [InlineKeyboardButton(t(lang, "btn_by_position"), callback_data="id_position")],
-        [InlineKeyboardButton(t(lang, "btn_dont_know"), callback_data="id_both")],
-    ])
-    await message.reply_text(t(lang, "ask_identify"), reply_markup=kb)
-    return IDENTIFY
-
-
-async def identify_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь выбрал идентификацию по цвету."""
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    await q.edit_message_text(t(lang, "ask_shirt"))
+    await update.message.reply_text(t(uid, 'ask_shirt'))
     return SHIRT_COLOR
 
-
-async def identify_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь выбрал идентификацию по позиции."""
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "btn_near"), callback_data="pos_near")],
-        [InlineKeyboardButton(t(lang, "btn_far"), callback_data="pos_far")],
-    ])
-    await q.edit_message_text(t(lang, "ask_position"), reply_markup=kb)
-    return POSITION
-
-
-async def identify_both(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь не знает — анализируем обоих/ближнего."""
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    context.user_data["identify_mode"] = "both"
-    await q.edit_message_text(t(lang, "ask_video"))
-    return VIDEO
-
-
-async def get_shirt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def get_shirt_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    lang = db.get_lang(uid)
-    context.user_data["identify_mode"] = "color"
-    context.user_data["shirt"] = update.message.text.strip()[:100]
-    await update.message.reply_text(t(lang, "ask_video"))
+    context.user_data['shirt'] = update.message.text
+    await update.message.reply_text(t(uid, 'ask_opponent', shirt=update.message.text))
+    return OPPONENT_SHIRT
+
+async def get_opponent_shirt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    context.user_data['opponent_shirt'] = update.message.text
+    await update.message.reply_text(t(uid, 'ask_video'))
     return VIDEO
-
-
-async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь выбрал сторону корта."""
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    context.user_data["identify_mode"] = "position"
-    context.user_data["position"] = "near" if q.data == "pos_near" else "far"
-    await q.edit_message_text(t(lang, "ask_video"))
-    return VIDEO
-
 
 async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    lang = db.get_lang(uid)
-    name = update.effective_user.first_name
-
-    # Строим описание как найти игрока — зависит от выбранного режима
-    mode = context.user_data.get("identify_mode", "both")
-    if mode == "color":
-        target_desc = t(lang, "identify_color", shirt=context.user_data.get("shirt", "?"))
-    elif mode == "position":
-        pos_key = "pos_near" if context.user_data.get("position") == "near" else "pos_far"
-        target_desc = t(lang, "identify_position", position=t(lang, pos_key))
-    else:
-        target_desc = t(lang, "identify_both")
-
-    if uid in processing_users:
-        await update.message.reply_text(t(lang, "busy"))
-        return ConversationHandler.END
-
-    processing_users.add(uid)
-    msg = await update.message.reply_text(t(lang, "processing"))
-    tmpdir = tempfile.mkdtemp()
-    loop = asyncio.get_event_loop()
-
+    shirt = context.user_data.get('shirt', 'unknown')
+    opp   = context.user_data.get('opponent_shirt', 'unknown')
+    name  = update.effective_user.first_name
+    lang  = user_lang.get(uid, 'ru')
+    msg   = await update.message.reply_text(t(uid, 'processing'))
     try:
-        video_path = f"{tmpdir}/video.mp4"
-        frames_dir = f"{tmpdir}/frames"
-        os.makedirs(frames_dir)
-
-        # Скачивание
-        if update.message.document or update.message.video:
-            fo = update.message.document or update.message.video
-            tf = await context.bot.get_file(fo.file_id)
-            await tf.download_to_drive(video_path)
-        elif update.message.text and "http" in update.message.text:
-            url = update.message.text.strip()
-            # YouTube блокирует скачивание с серверов — просим файл или Drive
-            if "youtube.com" in url or "youtu.be" in url:
-                await msg.edit_text(t(lang, "err_youtube"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = f'{tmpdir}/video.mp4'
+            frames_dir = f'{tmpdir}/frames'
+            os.makedirs(frames_dir)
+            if update.message.document or update.message.video:
+                fo = update.message.document or update.message.video
+                tf = await context.bot.get_file(fo.file_id)
+                await tf.download_to_drive(video_path)
+            elif update.message.text and 'http' in update.message.text:
+                await msg.edit_text(t(uid, 'downloading'))
+                if not download_video(update.message.text.strip(), video_path):
+                    await msg.edit_text(t(uid, 'err_download'))
+                    return ConversationHandler.END
+            else:
+                await msg.edit_text(t(uid, 'err_format'))
                 return ConversationHandler.END
-            await msg.edit_text(t(lang, "downloading"))
-            ok = await loop.run_in_executor(
-                None, _download_video_sync, url, video_path)
-            if not ok:
-                await msg.edit_text(t(lang, "err_download"))
+            await msg.edit_text(t(uid, 'extracting'))
+            frames = extract_frames(video_path, frames_dir, MOTION_THRESHOLD, MAX_FRAMES)
+            if len(frames) < 3:
+                await msg.edit_text(t(uid, 'err_frames'))
                 return ConversationHandler.END
-        else:
-            await msg.edit_text(t(lang, "err_format"))
-            return ConversationHandler.END
-
-        # Нарезка кадров
-        await msg.edit_text(t(lang, "extracting"))
-        frames = await loop.run_in_executor(
-            None, _extract_frames_sync, video_path, frames_dir)
-        if len(frames) < 3:
-            logger.warning("Мало кадров (%d) для user %s", len(frames), uid)
-            await msg.edit_text(t(lang, "err_frames"))
-            return ConversationHandler.END
-
-        # Списываем кредит ТОЛЬКО когда уверены что анализ пойдёт.
-        # Админ не платит.
-        if not _is_admin(uid):
-            if not db.consume_credit(uid):
-                await msg.edit_text(t(lang, "no_credits"),
-                                    reply_markup=buy_keyboard(lang))
-                return ConversationHandler.END
-
-        # AI анализ с таймаутом
-        await msg.edit_text(t(lang, "analyzing", n=len(frames)))
-        try:
-            report = await asyncio.wait_for(
-                loop.run_in_executor(None, _analyze_sync,
-                                     frames, target_desc, name, lang),
-                timeout=ANALYSIS_TIMEOUT)
-        except asyncio.TimeoutError:
-            if not _is_admin(uid):
-                db.add_credits(uid, 1)  # вернуть кредит
-            await msg.edit_text(t(lang, "err_timeout"))
-            return ConversationHandler.END
-
-        # PDF
-        await msg.edit_text(t(lang, "generating"))
-        pdf_path = f"{tmpdir}/report.pdf"
-        await loop.run_in_executor(
-            None, _generate_pdf_sync, report, name, len(frames), lang, pdf_path)
-
-        db.log_analysis(uid, len(frames), target_desc[:100])
-        remaining = db.get_credits(uid)
-
-        with open(pdf_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"RallyIQ_{name}_{datetime.now().strftime('%d%m%Y')}.pdf",
-                caption=t(lang, "done", name=name, credits=remaining),
-                reply_markup=menu_keyboard(lang),
-            )
-        await msg.delete()
-
+            await msg.edit_text(t(uid, 'analyzing', n=len(frames)))
+            report = analyze_video(frames, shirt, opp, name, lang)
+            await msg.edit_text(t(uid, 'generating'))
+            pdf_path = generate_pdf(report, name, len(frames), lang)
+            user_credits[uid] = user_credits.get(uid, 1) - 1
+            remaining = user_credits.get(uid, 0)
+            next_action = t(uid, 'buy_more') if remaining == 0 else t(uid, 'next_analyze')
+            with open(pdf_path, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=f'BadmintonAI_{name}_{datetime.now().strftime("%d%m%Y")}.pdf',
+                    caption=t(uid, 'done', name=name, credits=remaining, next_action=next_action)
+                )
+            await msg.delete()
     except Exception as e:
-        logger.exception("Ошибка при обработке видео для %s: %s", uid, e)
-        await msg.edit_text(t(lang, "err_general"))
-    finally:
-        processing_users.discard(uid)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
+        await msg.edit_text(t(uid, 'err_general', error=str(e)))
     return ConversationHandler.END
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = db.get_lang(update.effective_user.id)
-    await update.message.reply_text(
-        t(lang, "cancelled"), reply_markup=menu_keyboard(lang))
+    await update.message.reply_text(t(update.effective_user.id, 'cancelled'))
     return ConversationHandler.END
 
-
-
-# ==================================================
-# АДМИН-КОМАНДЫ (только для ADMIN_ID)
-# ==================================================
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главная админ-панель."""
-    if not _is_admin(update.effective_user.id):
-        return
-    text = (
-        "🛠 Админ-панель RallyIQ\n\n"
-        "/stats — статистика проекта\n"
-        "/users — последние пользователи\n"
-        "/give user_id кол-во — начислить кредиты\n"
-        "/giveme кол-во — начислить себе\n\n"
-        "Ты администратор — все анализы бесплатны."
-    )
-    await update.message.reply_text(text)
-
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id):
-        return
-    s = db.get_stats()
-    text = (
-        "📊 *Статистика RallyIQ*\n\n"
-        f"👥 Всего пользователей: {s['total_users']}\n"
-        f"🎬 Всего анализов: {s['total_analyses']}\n"
-        f"💳 Кредитов на балансах: {s['total_credits']}\n"
-        f"🔥 Анализов за 7 дней: {s['active_week']}"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id):
-        return
-    users = db.get_recent_users(15)
-    if not users:
-        await update.message.reply_text("Пока нет пользователей.")
-        return
-    lines = ["👥 *Последние пользователи:*\n"]
-    for u in users:
-        uname = f"@{u['username']}" if u["username"] else "—"
-        lines.append(
-            f"`{u['user_id']}` {u['first_name'] or ''} {uname}\n"
-            f"   💳 {u['credits']} | 🎬 {u['analyses_count']} | 🌐 {u['lang']}"
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def admin_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/give <user_id> <amount> — начислить кредиты пользователю."""
-    if not _is_admin(update.effective_user.id):
-        return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Использование: /give <user_id> <кол-во>")
-        return
-    try:
-        target_id = int(args[0])
-        amount = int(args[1])
-    except ValueError:
-        await update.message.reply_text("user_id и кол-во должны быть числами.")
-        return
-    new_balance = db.add_credits_by_id(target_id, amount)
-    if new_balance is None:
-        await update.message.reply_text(
-            f"❌ Пользователь {target_id} не найден.\n"
-            "Он должен сначала написать /start боту."
-        )
-        return
-    await update.message.reply_text(
-        f"✅ Начислено {amount} анализов пользователю {target_id}.\n"
-        f"Новый баланс: {new_balance}"
-    )
-    # Уведомляем пользователя
-    try:
-        await context.bot.send_message(
-            target_id,
-            f"🎁 Тебе начислено {amount} анализов! Баланс: {new_balance}"
-        )
-    except Exception:
-        pass
-
-
-async def admin_giveme(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/giveme <amount> — начислить себе."""
-    if not _is_admin(update.effective_user.id):
-        return
-    args = context.args
-    amount = int(args[0]) if args and args[0].isdigit() else 10
-    db.ensure_user(update.effective_user.id, update.effective_user.username,
-                   update.effective_user.first_name)
-    new_balance = db.add_credits_by_id(update.effective_user.id, amount)
-    await update.message.reply_text(f"✅ Начислено {amount}. Баланс: {new_balance}")
-
-
-async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Заглушка для неактивных кнопок."""
-    await update.callback_query.answer("Скоро будет доступно", show_alert=False)
-
-
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Ловит нажатия кнопок постоянного меню (текст) и направляет в нужный handler.
-    Работает на всех языках — сравнивает с локализованными подписями кнопок.
-    """
-    uid = update.effective_user.id
-    lang = db.get_lang(uid)
-    text = (update.message.text or "").strip()
-
-    # Сопоставляем нажатую кнопку с действием на любом из языков
-    if text in (TEXTS["ru"]["menu_analyze"], TEXTS["kz"]["menu_analyze"], TEXTS["en"]["menu_analyze"]):
-        return await analyze_entry_cmd(update, context)
-    if text in (TEXTS["ru"]["menu_buy"], TEXTS["kz"]["menu_buy"], TEXTS["en"]["menu_buy"]):
-        return await buy(update, context)
-    if text in (TEXTS["ru"]["menu_balance"], TEXTS["kz"]["menu_balance"], TEXTS["en"]["menu_balance"]):
-        return await balance(update, context)
-    if text in (TEXTS["ru"]["menu_language"], TEXTS["kz"]["menu_language"], TEXTS["en"]["menu_language"]):
-        return await language_command(update, context)
-    if text in (TEXTS["ru"]["menu_faq"], TEXTS["kz"]["menu_faq"], TEXTS["en"]["menu_faq"]):
-        return await faq_command(update, context)
-    # Не кнопка меню — игнорируем (или подсказываем)
-    await update.message.reply_text(t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
-
-
-async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает FAQ с разделами."""
-    lang = db.get_lang(update.effective_user.id)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "faq_btn_drive"), callback_data="faq_drive")],
-        [InlineKeyboardButton(t(lang, "faq_btn_video"), callback_data="faq_video")],
-        [InlineKeyboardButton(t(lang, "faq_btn_how"), callback_data="faq_how")],
-        [InlineKeyboardButton(t(lang, "faq_btn_time"), callback_data="faq_time")],
-    ])
-    await update.message.reply_text(t(lang, "faq_main"), reply_markup=kb)
-
-
-async def faq_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает конкретный раздел FAQ."""
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    section = q.data.replace("faq_", "")  # drive/video/how/time
-    text = t(lang, f"faq_{section}")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "faq_btn_back"), callback_data="faq_back")],
-    ])
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-
-
-async def faq_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Возврат к списку разделов FAQ."""
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "faq_btn_drive"), callback_data="faq_drive")],
-        [InlineKeyboardButton(t(lang, "faq_btn_video"), callback_data="faq_video")],
-        [InlineKeyboardButton(t(lang, "faq_btn_how"), callback_data="faq_how")],
-        [InlineKeyboardButton(t(lang, "faq_btn_time"), callback_data="faq_time")],
-    ])
-    await q.edit_message_text(t(lang, "faq_main"), reply_markup=kb)
-
-
-# ==================================================
-# ЗАПУСК
-# ==================================================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Логирует все необработанные ошибки вместо краша."""
-    logger.error("Необработанная ошибка: %s", context.error, exc_info=context.error)
-
-
-async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands([
-        ("analyze", "🏸 Analyze video"),
-        ("buy", "💳 Buy analyses"),
-        ("free", "🎁 Free analysis"),
-        ("balance", "💰 My balance"),
-        ("language", "🌐 Change language"),
-        ("help", "❓ Help"),
-    ])
-    logger.info("Команды меню установлены")
-
-
-def main() -> None:
-    db.init_pool()
-    db.init_schema()
-
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("analyze", analyze_entry_cmd),
-            CallbackQueryHandler(analyze_entry_btn, pattern="^go_analyze$"),
-            # Кнопка "Анализ" в постоянном меню (на всех языках)
-            MessageHandler(
-                filters.Regex(f"^({TEXTS['ru']['menu_analyze']}|{TEXTS['kz']['menu_analyze']}|{TEXTS['en']['menu_analyze']})$"),
-                analyze_entry_cmd,
-            ),
-        ],
+        entry_points=[CommandHandler('analyze', analyze_start)],
         states={
-            IDENTIFY: [
-                CallbackQueryHandler(identify_color, pattern="^id_color$"),
-                CallbackQueryHandler(identify_position, pattern="^id_position$"),
-                CallbackQueryHandler(identify_both, pattern="^id_both$"),
-            ],
-            SHIRT_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_shirt)],
-            POSITION: [
-                CallbackQueryHandler(get_position, pattern="^pos_(near|far)$"),
-            ],
+            SHIRT_COLOR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_shirt_color)],
+            OPPONENT_SHIRT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_opponent_shirt)],
             VIDEO: [
                 MessageHandler(filters.Document.ALL | filters.VIDEO, process_video),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_video),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_video)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler('cancel', cancel)]
     )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("language", language_command))
-    app.add_handler(CommandHandler("buy", buy))
-    app.add_handler(CommandHandler("free", free_analysis))
-    app.add_handler(CommandHandler("balance", balance))
-    # Админские команды
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("stats", admin_stats))
-    app.add_handler(CommandHandler("users", admin_users))
-    app.add_handler(CommandHandler("give", admin_give))
-    app.add_handler(CommandHandler("giveme", admin_giveme))
+    app.add_handler(CommandHandler('start',  start))
+    app.add_handler(CommandHandler('help',   help_command))
+    app.add_handler(CommandHandler('buy',    buy))
+    app.add_handler(CommandHandler('free',   free_analysis))
     app.add_handler(conv)
-    # Роутер кнопок меню — ловит buy/balance/language/help вне диалога
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
-    app.add_handler(CallbackQueryHandler(lang_callback, pattern="^lang_"))
-    app.add_handler(CallbackQueryHandler(buy_callback, pattern="^go_buy$"))
-    app.add_handler(CallbackQueryHandler(paid_callback, pattern="^paid_5$"))
-    app.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
-    app.add_handler(CallbackQueryHandler(faq_back, pattern="^faq_back$"))
-    app.add_handler(CallbackQueryHandler(faq_section, pattern="^faq_(drive|video|how|time)$"))
+    app.add_handler(CallbackQueryHandler(lang_callback, pattern='^lang_'))
+    app.add_handler(CallbackQueryHandler(paid_callback, pattern='^paid_5$'))
+    print('Bot started!')
+    app.run_polling()
 
-    app.add_error_handler(error_handler)
-    logger.info("RallyIQ запущен")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

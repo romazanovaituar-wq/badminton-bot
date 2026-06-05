@@ -618,9 +618,14 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tf = await context.bot.get_file(fo.file_id)
             await tf.download_to_drive(video_path)
         elif update.message.text and "http" in update.message.text:
+            url = update.message.text.strip()
+            # YouTube блокирует скачивание с серверов — просим файл или Drive
+            if "youtube.com" in url or "youtu.be" in url:
+                await msg.edit_text(t(lang, "err_youtube"))
+                return ConversationHandler.END
             await msg.edit_text(t(lang, "downloading"))
             ok = await loop.run_in_executor(
-                None, _download_video_sync, update.message.text.strip(), video_path)
+                None, _download_video_sync, url, video_path)
             if not ok:
                 await msg.edit_text(t(lang, "err_download"))
                 return ConversationHandler.END
@@ -702,14 +707,14 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update.effective_user.id):
         return
     text = (
-        "🛠 *Админ-панель RallyIQ*\n\n"
+        "🛠 Админ-панель RallyIQ\n\n"
         "/stats — статистика проекта\n"
         "/users — последние пользователи\n"
-        "/give <user_id> <кол-во> — начислить кредиты\n"
-        "/giveme <кол-во> — начислить себе\n\n"
+        "/give user_id кол-во — начислить кредиты\n"
+        "/giveme кол-во — начислить себе\n\n"
         "Ты администратор — все анализы бесплатны."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):

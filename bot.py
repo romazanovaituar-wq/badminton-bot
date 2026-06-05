@@ -377,59 +377,229 @@ def _ensure_fonts() -> None:
             FONT_BLD)
 
 
+def _section_color(title: str) -> tuple:
+    """Возвращает цвет акцента для секции по ключевым словам (RU/KZ/EN)."""
+    t_low = title.lower()
+    # Сильные стороны — бирюзовый/зелёный
+    if any(w in t_low for w in ["сильн", "күшті", "strength"]):
+        return (0, 200, 150)
+    # Ошибки — оранжевый
+    if any(w in t_low for w in ["ошибк", "қател", "mistake"]):
+        return (255, 140, 60)
+    # Тактика — голубой
+    if any(w in t_low for w in ["тактик", "tactic"]):
+        return (80, 170, 255)
+    # Упражнения — фиолетовый
+    if any(w in t_low for w in ["упражнен", "жаттығу", "drill"]):
+        return (180, 130, 255)
+    # Итог — золотой
+    if any(w in t_low for w in ["итог", "қорытынд", "summary"]):
+        return (240, 190, 90)
+    return (120, 200, 255)
+
+
+def _parse_scores(report: str) -> tuple:
+    """
+    Извлекает строку SCORES из отчёта GPT.
+    Возвращает (scores_dict | None, report_без_строки_scores).
+    """
+    import re
+    scores = None
+    lines = report.split("\n")
+    clean_lines = []
+    for line in lines:
+        m = re.match(r"\s*SCORES:\s*(.+)", line, re.IGNORECASE)
+        if m and scores is None:
+            parts = [p.strip() for p in m.group(1).split("|")]
+            nums = []
+            for p in parts:
+                try:
+                    nums.append(max(0, min(100, int(re.sub(r"[^0-9]", "", p)))))
+                except (ValueError, TypeError):
+                    nums.append(0)
+            if len(nums) >= 6:
+                scores = {
+                    "overall": nums[0],
+                    "footwork": nums[1],
+                    "technique": nums[2],
+                    "tactics": nums[3],
+                    "positioning": nums[4],
+                    "recovery": nums[5],
+                }
+            continue  # строку SCORES не добавляем в текст
+        clean_lines.append(line)
+    return scores, "\n".join(clean_lines)
+
+
+def _score_color(value: int) -> tuple:
+    """Цвет полоски по баллу: красный/жёлтый/зелёный."""
+    if value < 60:
+        return (230, 90, 80)    # красный
+    if value < 75:
+        return (240, 190, 90)   # жёлтый/золотой
+    return (0, 200, 150)        # зелёный
+
+
 def _generate_pdf_sync(report: str, name: str, frames_count: int,
                        lang: str, out_path: str) -> str:
     _ensure_fonts()
 
+    # Извлекаем оценки игрока (если GPT их выдал)
+    scores, report = _parse_scores(report)
+
+    # Премиум тёмная палитра
+    BG_DARK   = (18, 22, 33)      # фон страницы
+    CARD      = (28, 34, 49)      # карточки секций
+    GOLD      = (240, 190, 90)    # золотой акцент
+    WHITE     = (235, 240, 248)
+    GREY      = (150, 160, 178)
+
     class Report(FPDF):
         def header(self):
-            self.set_font("Roboto", "B", 15)
-            self.set_fill_color(20, 60, 140)
-            self.set_text_color(255, 255, 255)
-            self.cell(0, 14, "  RALLYIQ — AI BADMINTON COACH",
-                      fill=True, new_x="LMARGIN", new_y="NEXT")
-            self.set_text_color(0, 0, 0)
-            self.ln(3)
+            # Тёмный фон всей страницы
+            self.set_fill_color(*BG_DARK)
+            self.rect(0, 0, self.w, self.h, "F")
 
         def footer(self):
-            self.set_y(-15)
+            self.set_y(-14)
             self.set_font("Roboto", "", 8)
-            self.set_text_color(150, 150, 150)
-            self.cell(0, 10,
-                      f"RallyIQ | {datetime.now().strftime('%d.%m.%Y')} | Page {self.page_no()}",
+            self.set_text_color(*GREY)
+            self.cell(0, 8,
+                      f"RallyIQ  ·  {datetime.now().strftime('%d.%m.%Y')}  ·  {self.page_no()}",
                       align="C")
 
     pdf = Report()
     pdf.add_font("Roboto", "", FONT_REG)
     pdf.add_font("Roboto", "B", FONT_BLD)
+    pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=20)
 
-    pdf.set_font("Roboto", "", 10)
-    pdf.set_fill_color(245, 248, 255)
-    pdf.cell(0, 9,
-             f"  Player: {name}   |   Frames: {frames_count}   |   {datetime.now().strftime('%d.%m.%Y')}",
-             fill=True, new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(5)
+    # ====== ОБЛОЖКА-ШАПКА ======
+    # Золотая полоса сверху
+    pdf.set_fill_color(*GOLD)
+    pdf.rect(0, 0, pdf.w, 3, "F")
 
+    pdf.set_y(18)
+    pdf.set_font("Roboto", "B", 26)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 14, "RallyIQ", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Roboto", "", 12)
+    pdf.set_text_color(*GOLD)
+    pdf.cell(0, 7, "AI BADMINTON COACH", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(6)
+
+    # Карточка с инфо об игроке
+    pdf.set_fill_color(*CARD)
+    card_y = pdf.get_y()
+    pdf.rect(pdf.l_margin, card_y, pdf.w - 2*pdf.l_margin, 22, "F")
+    # Золотая вертикальная полоска слева карточки
+    pdf.set_fill_color(*GOLD)
+    pdf.rect(pdf.l_margin, card_y, 1.5, 22, "F")
+
+    pdf.set_xy(pdf.l_margin + 6, card_y + 4)
+    pdf.set_font("Roboto", "B", 14)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 7, name, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(pdf.l_margin + 6)
+    pdf.set_font("Roboto", "", 9)
+    pdf.set_text_color(*GREY)
+    pdf.cell(0, 6,
+             f"{datetime.now().strftime('%d.%m.%Y')}   ·   проанализировано кадров: {frames_count}",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(8)
+
+    # ====== БЛОК ОЦЕНОК ======
+    if scores:
+        labels = {
+            "ru": {"title": "ОЦЕНКА ИГРЫ", "footwork": "Работа ног",
+                   "technique": "Техника", "tactics": "Тактика",
+                   "positioning": "Позиционирование", "recovery": "Восстановление"},
+            "kz": {"title": "ОЙЫН БАҒАСЫ", "footwork": "Аяқ жұмысы",
+                   "technique": "Техника", "tactics": "Тактика",
+                   "positioning": "Позиция", "recovery": "Қалпына келу"},
+            "en": {"title": "PERFORMANCE SCORE", "footwork": "Footwork",
+                   "technique": "Technique", "tactics": "Tactics",
+                   "positioning": "Positioning", "recovery": "Recovery"},
+        }.get(lang, None)
+        if labels is None:
+            labels = {"title": "PERFORMANCE SCORE", "footwork": "Footwork",
+                      "technique": "Technique", "tactics": "Tactics",
+                      "positioning": "Positioning", "recovery": "Recovery"}
+
+        # Общий балл — крупно
+        overall = scores["overall"]
+        ov_color = _score_color(overall)
+        pdf.set_font("Roboto", "B", 11)
+        pdf.set_text_color(*GOLD)
+        pdf.cell(0, 7, labels["title"], new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+
+        y0 = pdf.get_y()
+        pdf.set_font("Roboto", "B", 40)
+        pdf.set_text_color(*ov_color)
+        pdf.cell(40, 18, str(overall), new_x="RIGHT", new_y="TOP")
+        pdf.set_font("Roboto", "", 12)
+        pdf.set_text_color(*GREY)
+        pdf.set_xy(pdf.l_margin + 32, y0 + 9)
+        pdf.cell(0, 8, "/ 100", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_y(y0 + 20)
+        pdf.ln(2)
+
+        # Полоски по категориям
+        cats = ["footwork", "technique", "tactics", "positioning", "recovery"]
+        bar_x = pdf.l_margin + 48
+        bar_w = pdf.w - pdf.l_margin - bar_x - 12
+        for cat in cats:
+            val = scores[cat]
+            col = _score_color(val)
+            yc = pdf.get_y()
+            # Подпись
+            pdf.set_font("Roboto", "", 9)
+            pdf.set_text_color(*WHITE)
+            pdf.set_xy(pdf.l_margin, yc)
+            pdf.cell(46, 6, labels[cat], new_x="RIGHT", new_y="TOP")
+            # Фон полоски
+            pdf.set_fill_color(40, 48, 66)
+            pdf.rect(bar_x, yc + 1.5, bar_w, 3.5, "F")
+            # Заполнение
+            pdf.set_fill_color(*col)
+            pdf.rect(bar_x, yc + 1.5, bar_w * val / 100, 3.5, "F")
+            # Число
+            pdf.set_font("Roboto", "B", 9)
+            pdf.set_text_color(*col)
+            pdf.set_xy(pdf.w - pdf.l_margin - 12, yc)
+            pdf.cell(12, 6, str(val), align="R", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+        pdf.ln(6)
+
+    # ====== СЕКЦИИ ======
     current = None
     buffer: list[str] = []
 
     def flush():
-        if current and buffer:
-            pdf.ln(3)
-            pdf.set_font("Roboto", "B", 12)
-            pdf.set_fill_color(220, 230, 255)
-            pdf.set_text_color(20, 60, 140)
-            pdf.cell(0, 9, f"  {current}", fill=True,
-                     new_x="LMARGIN", new_y="NEXT")
-            pdf.set_text_color(0, 0, 0)
-            pdf.ln(2)
-            for ln in buffer:
-                pdf.set_font("Roboto", "", 10)
-                txt = f"  {ln}" if (ln and ln[0].isdigit()) else ln
-                pdf.multi_cell(185, 6, txt, new_x="LMARGIN", new_y="NEXT")
-                pdf.ln(1)
+        if not (current and buffer):
+            return
+        accent = _section_color(current)
+        # Заголовок секции с цветной полоской
+        pdf.ln(2)
+        y = pdf.get_y()
+        pdf.set_fill_color(*accent)
+        pdf.rect(pdf.l_margin, y + 1, 4, 7, "F")
+        pdf.set_x(pdf.l_margin + 7)
+        pdf.set_font("Roboto", "B", 13)
+        pdf.set_text_color(*accent)
+        pdf.cell(0, 9, current.upper(), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+        # Пункты
+        pdf.set_text_color(*WHITE)
+        for ln in buffer:
+            pdf.set_font("Roboto", "", 10)
+            pdf.set_x(pdf.l_margin + 2)
+            pdf.multi_cell(pdf.w - 2*pdf.l_margin - 4, 6, ln,
+                           new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(0.5)
+        pdf.ln(3)
 
     for line in report.split("\n"):
         line = line.strip()
@@ -439,21 +609,28 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
             flush()
             current = line[3:].strip()
             buffer = []
+        elif line.startswith("#"):
+            continue
         else:
             buffer.append(line)
     flush()
 
-    # Дисклеймер
-    pdf.ln(6)
+    # ====== ДИСКЛЕЙМЕР ======
+    pdf.ln(4)
+    pdf.set_draw_color(*GREY)
+    pdf.set_line_width(0.2)
+    y = pdf.get_y()
+    pdf.line(pdf.l_margin, y, pdf.w - pdf.l_margin, y)
+    pdf.ln(3)
     pdf.set_font("Roboto", "", 8)
-    pdf.set_text_color(150, 150, 150)
+    pdf.set_text_color(*GREY)
     disclaimer = {
         "ru": "Отчёт сгенерирован AI на основе кадров видео и может содержать неточности. Не заменяет очного тренера.",
         "kz": "Есеп бейне кадрлары негізінде AI арқылы жасалған, дәл болмауы мүмкін. Жаттықтырушыны алмастырмайды.",
         "en": "This report is AI-generated from video frames and may contain inaccuracies. Not a substitute for a real coach.",
     }.get(lang, "")
-    pdf.multi_cell(185, 4, disclaimer, new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(0, 0, 0)
+    pdf.multi_cell(pdf.w - 2*pdf.l_margin, 4, disclaimer,
+                   new_x="LMARGIN", new_y="NEXT")
 
     pdf.output(out_path)
     return out_path

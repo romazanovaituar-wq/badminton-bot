@@ -357,7 +357,6 @@ def _analyze_sync(frames: list[dict], target: str,
     frame_prompt = t(lang, "frame_prompt", target=target)
     descriptions: list[str] = []
     not_found_count = 0
-    pause_count = 0
 
     for i, frame in enumerate(frames):
         resp = client.chat.completions.create(
@@ -376,10 +375,10 @@ def _analyze_sync(frames: list[dict], target: str,
         if "TARGET_NOT_FOUND" in up:
             not_found_count += 1
         elif "NOT VISIBLE" in up:
-            pass  # в этом кадре не видно — нормально, просто пропускаем
-        elif up.strip().startswith("PAUSE"):
-            pause_count += 1  # неигровой момент (отдых/пауза) — не оцениваем технику
+            pass  # в этом кадре игрока не видно — пропускаем
         else:
+            # Всё остальное (включая PAUSE-кадры) идёт в анализ.
+            # GPT сам учтёт что некоторые моменты — паузы.
             descriptions.append(f"Frame {i+1} ({frame['time']:.0f}s): {desc}")
 
     # Отказываем ТОЛЬКО если игрок реально отсутствует на видео:
@@ -390,12 +389,9 @@ def _analyze_sync(frames: list[dict], target: str,
     if total > 0 and not_found_count >= total * 0.7:
         return "TARGET_NOT_FOUND"
 
-    # Если набралось хотя бы одно игровое описание — анализируем по нему.
-    # Если совсем ничего (только паузы) — берём что есть, но не отказываем,
-    # а просим GPT работать с тем что было видно.
-    # Если набралось слишком мало описаний игрока — честный отказ,
-    # а не пустой отчёт. Не списываем кредит зря.
-    if len(descriptions) < 2:
+    # Отказ только если ВООБЩЕ ничего не описано (0 кадров с игроком).
+    # Если есть хотя бы 1 описание — анализируем (частичный анализ лучше отказа).
+    if len(descriptions) == 0:
         return "NOT_ENOUGH_DATA"
 
     # РЕАЛЬНЫЕ ИЗМЕРЕНИЯ через MediaPipe (если доступен).

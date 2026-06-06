@@ -64,7 +64,7 @@ ADMIN_USERNAME   = os.environ.get("ADMIN_USERNAME", "@N1world1N")  # для св
 def _is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
-IDENTIFY, SHIRT_COLOR, POSITION, VIDEO = range(4)
+GAME_TYPE, IDENTIFY, SHIRT_COLOR, POSITION, VIDEO = range(5)
 
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
 
@@ -401,9 +401,28 @@ def _analyze_sync(frames: list[dict], target: str,
             "Analyze any visible playing technique and positioning."
         )
 
+    # РЕАЛЬНЫЕ ИЗМЕРЕНИЯ через MediaPipe (если доступен).
+    # Считаем метрики позы по кадрам и даём GPT как объективные данные,
+    # чтобы оценка опиралась на измерения, а не только на догадки по картинкам.
+    pose_note = ""
+    try:
+        frame_paths = [f["path"] for f in frames]
+        metrics = pose.analyze_frames(frame_paths)
+        if metrics:
+            summary = pose.metrics_summary(metrics, lang)
+            if summary:
+                logger.info("Pose-метрики: %s", summary)
+                pose_note = (
+                    "\n\nОБЪЕКТИВНЫЕ ИЗМЕРЕНИЯ позы игрока (данные компьютерного "
+                    "зрения, опирайся на них при оценке техники и работы ног): "
+                    + summary
+                )
+    except Exception as e:
+        logger.warning("Pose-анализ пропущен: %s", e)
+
     report_prompt = t(lang, "report_prompt",
                       n=len(descriptions), name=name, target=target,
-                      frames="\n".join(descriptions))
+                      frames="\n".join(descriptions)) + pose_note
     resp = client.chat.completions.create(
         model="gpt-4o",
         max_tokens=1500,

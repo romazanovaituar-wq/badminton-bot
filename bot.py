@@ -65,7 +65,7 @@ def _is_admin(user_id: int) -> bool:
 
 IDENTIFY, SHIRT_COLOR, POSITION, VIDEO = range(4)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
 
 # Защита от двойного запуска: кто сейчас обрабатывает видео
 processing_users: set[int] = set()

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+README.md
+launch_kit.md
+nixpacks.toml
+Procfile
+*.pdf
+.env

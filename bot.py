@@ -393,13 +393,10 @@ def _analyze_sync(frames: list[dict], target: str,
     # Если набралось хотя бы одно игровое описание — анализируем по нему.
     # Если совсем ничего (только паузы) — берём что есть, но не отказываем,
     # а просим GPT работать с тем что было видно.
-    if not descriptions:
-        # Все кадры — паузы или не видно. Не отказываем, но честно помечаем
-        # что игровых моментов мало. GPT сделает что сможет.
-        descriptions.append(
-            "Frame info: most frames show non-active moments (rest/pauses). "
-            "Analyze any visible playing technique and positioning."
-        )
+    # Если набралось слишком мало описаний игрока — честный отказ,
+    # а не пустой отчёт. Не списываем кредит зря.
+    if len(descriptions) < 2:
+        return "NOT_ENOUGH_DATA"
 
     # РЕАЛЬНЫЕ ИЗМЕРЕНИЯ через MediaPipe (если доступен).
     # Считаем метрики позы по кадрам и даём GPT как объективные данные,
@@ -1120,6 +1117,16 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not _is_admin(uid):
                 db.add_credits(uid, 1)
             await msg.edit_text(t(lang, "err_target_not_found"))
+            await update.message.reply_text(
+                t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
+            return ConversationHandler.END
+
+        if report == "NOT_ENOUGH_DATA":
+            # Игрок не опознан в кадрах — честный отказ, возврат кредита,
+            # вместо пустого отчёта.
+            if not _is_admin(uid):
+                db.add_credits(uid, 1)
+            await msg.edit_text(t(lang, "err_not_enough_data"))
             await update.message.reply_text(
                 t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
             return ConversationHandler.END

@@ -276,3 +276,42 @@ def log_payment(user_id: int, stars: int, credits: int, charge_id: str) -> None:
                 INSERT INTO payments (user_id, stars, credits, charge_id)
                 VALUES (%s, %s, %s, %s);
             """, (user_id, stars, credits, charge_id))
+
+
+def get_all_user_ids() -> list[int]:
+    """Возвращает ID всех пользователей — для рассылки (broadcast)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users;")
+            return [row[0] for row in cur.fetchall()]
+
+
+def set_setting(key: str, value: str) -> None:
+    """Сохраняет настройку (например режим обслуживания)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                );
+            """)
+            cur.execute("""
+                INSERT INTO settings (key, value) VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+            """, (key, value))
+
+
+def get_setting(key: str, default: str = "") -> str:
+    """Читает настройку. Возвращает default если нет."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                );
+            """)
+            cur.execute("SELECT value FROM settings WHERE key = %s;", (key,))
+            row = cur.fetchone()
+            return row[0] if row else default

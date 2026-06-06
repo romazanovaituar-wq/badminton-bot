@@ -863,6 +863,12 @@ async def _start_analysis_flow(user, message, context):
     lang = db.get_lang(uid)
     db.ensure_user(uid, user.username, user.first_name)
 
+    # Режим обслуживания: не запускаем анализ, вежливо предупреждаем.
+    # Админ работает всегда (чтобы тестировать).
+    if not _is_admin(uid) and db.get_setting("maintenance", "0") == "1":
+        await message.reply_text(t(lang, "maintenance"))
+        return ConversationHandler.END
+
     if uid in processing_users:
         await message.reply_text(t(lang, "busy"))
         return ConversationHandler.END
@@ -1191,6 +1197,59 @@ async def admin_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/broadcast <текст> — рассылка сообщения всем пользователям."""
+    if not _is_admin(update.effective_user.id):
+        return
+    text = " ".join(context.args) if context.args else ""
+    if not text:
+        await update.message.reply_text(
+            "Использование: /broadcast <текст>\n\n"
+            "Пример: /broadcast 🔧 Через 5 минут короткое обновление (~3 мин). Спасибо за терпение!"
+        )
+        return
+
+    user_ids = db.get_all_user_ids()
+    sent = 0
+    failed = 0
+    await update.message.reply_text(f"📢 Начинаю рассылку для {len(user_ids)} пользователей...")
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1  # юзер заблокировал бота или удалил чат
+        # Небольшая пауза чтобы не упереться в лимиты Telegram
+        await asyncio.sleep(0.05)
+    await update.message.reply_text(
+        f"✅ Рассылка завершена.\nДоставлено: {sent}\nНе доставлено: {failed}"
+    )
+
+
+async def admin_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/maintenance on|off — режим обслуживания (бот отвечает что занят)."""
+    if not _is_admin(update.effective_user.id):
+        return
+    arg = (context.args[0].lower() if context.args else "")
+    if arg == "on":
+        db.set_setting("maintenance", "1")
+        await update.message.reply_text(
+            "🔧 Режим обслуживания ВКЛЮЧЕН.\n"
+            "Пользователи получат сообщение что бот обновляется.\n"
+            "Не забудь выключить: /maintenance off"
+        )
+    elif arg == "off":
+        db.set_setting("maintenance", "0")
+        await update.message.reply_text("✅ Режим обслуживания ВЫКЛЮЧЕН. Бот работает обычно.")
+    else:
+        status = db.get_setting("maintenance", "0")
+        state = "ВКЛЮЧЕН 🔧" if status == "1" else "выключен ✅"
+        await update.message.reply_text(
+            f"Режим обслуживания сейчас: {state}\n\n"
+            "Использование: /maintenance on  или  /maintenance off"
+        )
+
+
 async def admin_giveme(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/giveme <amount> — начислить себе."""
     if not _is_admin(update.effective_user.id):
@@ -1337,6 +1396,8 @@ def main() -> None:
     app.add_handler(CommandHandler("give", admin_give))
     app.add_handler(CommandHandler("take", admin_take))
     app.add_handler(CommandHandler("giveme", admin_giveme))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast))
+    app.add_handler(CommandHandler("maintenance", admin_maintenance))
     app.add_handler(conv)
     # Роутер кнопок меню — ловит buy/balance/language/help вне диалога
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))

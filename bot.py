@@ -905,12 +905,40 @@ async def _start_analysis_flow(user, message, context):
                 return ConversationHandler.END
 
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "btn_singles"), callback_data="game_singles")],
+        [InlineKeyboardButton(t(lang, "btn_doubles"), callback_data="game_doubles")],
+    ])
+    await message.reply_text(t(lang, "ask_game_type"), reply_markup=kb)
+    return GAME_TYPE
+
+
+async def game_singles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Одиночка — дальше старый поток (цвет/позиция/оба)."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    context.user_data["game_type"] = "singles"
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(t(lang, "btn_by_color"), callback_data="id_color")],
         [InlineKeyboardButton(t(lang, "btn_by_position"), callback_data="id_position")],
         [InlineKeyboardButton(t(lang, "btn_dont_know"), callback_data="id_both")],
     ])
-    await message.reply_text(t(lang, "ask_identify"), reply_markup=kb)
+    await q.message.reply_text(t(lang, "ask_identify"), reply_markup=kb)
     return IDENTIFY
+
+
+async def game_doubles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пара — спрашиваем сторону корта, потом цвет одежды."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    context.user_data["game_type"] = "doubles"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "btn_near"), callback_data="pos_near")],
+        [InlineKeyboardButton(t(lang, "btn_far"), callback_data="pos_far")],
+    ])
+    await q.message.reply_text(t(lang, "ask_doubles_side"), reply_markup=kb)
+    return POSITION
 
 
 async def identify_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -959,10 +987,18 @@ async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     lang = db.get_lang(q.from_user.id)
-    context.user_data["identify_mode"] = "position"
     context.user_data["position"] = "near" if q.data == "pos_near" else "far"
-    await q.message.reply_text(t(lang, "ask_video"))
-    return VIDEO
+
+    if context.user_data.get("game_type") == "doubles":
+        # Для пары: после стороны уточняем цвет одежды (сузить до игрока)
+        context.user_data["identify_mode"] = "doubles"
+        await q.message.reply_text(t(lang, "ask_doubles_color"))
+        return SHIRT_COLOR
+    else:
+        # Одиночка по позиции — сразу к видео
+        context.user_data["identify_mode"] = "position"
+        await q.message.reply_text(t(lang, "ask_video"))
+        return VIDEO
 
 
 async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -972,7 +1008,13 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Строим описание как найти игрока — зависит от выбранного режима
     mode = context.user_data.get("identify_mode", "both")
-    if mode == "color":
+    if mode == "doubles":
+        # Пара: сторона корта + цвет одежды (сужаем до конкретного игрока)
+        pos_key = "pos_near" if context.user_data.get("position") == "near" else "pos_far"
+        target_desc = t(lang, "identify_doubles",
+                        position=t(lang, pos_key),
+                        shirt=context.user_data.get("shirt", "?"))
+    elif mode == "color":
         target_desc = t(lang, "identify_color", shirt=context.user_data.get("shirt", "?"))
     elif mode == "position":
         pos_key = "pos_near" if context.user_data.get("position") == "near" else "pos_far"
@@ -1388,6 +1430,10 @@ def main() -> None:
             ),
         ],
         states={
+            GAME_TYPE: [
+                CallbackQueryHandler(game_singles, pattern="^game_singles$"),
+                CallbackQueryHandler(game_doubles, pattern="^game_doubles$"),
+            ],
             IDENTIFY: [
                 CallbackQueryHandler(identify_color, pattern="^id_color$"),
                 CallbackQueryHandler(identify_position, pattern="^id_position$"),

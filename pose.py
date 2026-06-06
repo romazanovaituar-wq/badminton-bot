@@ -256,56 +256,78 @@ def metrics_summary(m: dict, lang: str = "ru") -> str:
 def compute_scores(m: dict) -> dict | None:
     """
     Вычисляет баллы (0-100) НАПРЯМУЮ из измеренных метрик.
-    Это делает оценки ВОСПРОИЗВОДИМЫМИ — одно видео всегда даёт один балл,
-    потому что баллы выводятся из физических измерений, а не из догадок.
+    Воспроизводимо: одно видео = один балл.
 
-    Возвращает баллы по тем категориям, что можно измерить позой.
-    Тактику не считаем — её скелетом не измеришь (оставляем GPT).
+    Калибровка основана на биомеханических исследованиях бадминтона:
+    - профи эффективно сгибают колени (не обязательно глубже, а функциональнее)
+    - активность/скорость перемещений — маркер уровня
+    - вынос руки и собранный корпус = техника
+    Потолок поднят до 98, чтобы профи получали честные 88-95.
     """
     if not m:
         return None
 
-    def clamp(v):
-        return max(20, min(95, int(round(v))))
+    def clamp(v, lo=25, hi=98):
+        return max(lo, min(hi, int(round(v))))
 
     scores = {}
 
-    # FOOTWORK (работа ног): согнутые колени + активность перемещений.
-    # Идеальный сгиб колена в бадминтоне ~120-150° (готовность к рывку).
+    # FOOTWORK: функциональный сгиб колена (110-160° рабочий диапазон) + активность.
+    # Щедрее: рабочее колено даёт базу ~80, активность добавляет до +18.
     knee = m.get("knee_flex")
     mv = m.get("movement", 0) or 0
     if knee is not None:
-        # 120-150° = отлично (90), прямые >170 = плохо (40)
-        if knee <= 150:
-            knee_score = 90 - abs(135 - knee) * 0.8
+        if 110 <= knee <= 165:
+            knee_score = 80 - abs(140 - knee) * 0.4
+        elif knee > 165:
+            knee_score = 68 - (knee - 165) * 1.3        # прямые ноги = штраф
         else:
-            knee_score = 90 - (knee - 150) * 1.8  # штраф за прямые ноги
-        # активность добавляет до +15
-        move_bonus = min(15, mv * 2)
-        scores["footwork"] = clamp(knee_score + move_bonus - 7)
+            knee_score = 72 - (110 - knee) * 0.5
+        move_bonus = min(16, mv * 2.0)
+        scores["footwork"] = clamp(knee_score + move_bonus)
 
-    # TECHNIQUE (техника): вынос руки + угол локтя + наклон корпуса.
+    # TECHNIQUE: угол локтя (замах) + вынос руки вверх. Щедрая база.
     elbow = m.get("elbow_angle")
     arm = m.get("arm_up_ratio")
     if elbow is not None:
-        # согнутый локоть при замахе (~90-140) хорошо
-        elbow_score = 85 - abs(115 - elbow) * 0.6
+        elbow_score = 76 - abs(110 - elbow) * 0.45
         if arm is not None:
-            elbow_score += arm * 15  # рука часто поднята = +
+            elbow_score += arm * 20   # рука поднята для ударов сверху = техничнее
         scores["technique"] = clamp(elbow_score)
 
-    # POSITIONING (позиционирование): наклон корпуса (вертикальный = собран).
+    # POSITIONING: собранный корпус. Небольшой наклон вперёд нормален для готовности.
     lean = m.get("torso_lean")
     if lean is not None:
-        # умеренный наклon 5-20° норм, сильный >30 плохо
-        pos_score = 88 - max(0, lean - 18) * 1.5
+        pos_score = 84 - max(0, lean - 18) * 1.6
         scores["positioning"] = clamp(pos_score)
 
-    # RECOVERY (восстановление/баланс): симметрия + стабильность стойки.
+    # RECOVERY/баланс: симметрия плеч + активность (быстрое восстановление).
     bal = m.get("balance")
     if bal is not None:
-        # меньше разница плеч = ровнее = лучше. bal в процентах.
-        rec_score = 90 - bal * 2.5
+        rec_score = 86 - bal * 2.8
+        rec_score += min(8, mv * 1.0)
         scores["recovery"] = clamp(rec_score)
 
     return scores if scores else None
+
+
+def level_from_scores(scores: dict) -> str:
+    """
+    Определяет уровень игрока по измеренным баллам (англ. ключи).
+    Используется чтобы GPT не занижал всех до 'любителя'.
+    """
+    if not scores:
+        return ""
+    vals = [v for v in scores.values() if isinstance(v, (int, float))]
+    if not vals:
+        return ""
+    avg = sum(vals) / len(vals)
+    if avg >= 88:
+        return "профессиональный"
+    if avg >= 78:
+        return "продвинутый"
+    if avg >= 65:
+        return "уверенный любитель"
+    if avg >= 50:
+        return "любитель"
+    return "начинающий"

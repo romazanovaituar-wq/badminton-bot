@@ -407,12 +407,20 @@ def _analyze_sync(frames: list[dict], target: str,
             measured_scores = pose.compute_scores(metrics)
             if summary:
                 logger.info("Pose-метрики: %s", summary)
+                level_hint = ""
                 if measured_scores:
                     logger.info("Измеренные баллы: %s", measured_scores)
+                    lvl = pose.level_from_scores(measured_scores)
+                    if lvl:
+                        level_hint = (
+                            f"\n\nПо измеренным данным уровень игрока: {lvl}. "
+                            f"НЕ занижай уровень — если измерения показывают высокий "
+                            f"класс, так и пиши. Не называй всех любителями."
+                        )
                 pose_note = (
                     "\n\nОБЪЕКТИВНЫЕ ИЗМЕРЕНИЯ позы игрока (данные компьютерного "
                     "зрения, опирайся на них при оценке техники и работы ног): "
-                    + summary
+                    + summary + level_hint
                 )
     except Exception as e:
         logger.warning("Pose-анализ пропущен: %s", e)

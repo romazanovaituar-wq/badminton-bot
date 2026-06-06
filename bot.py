@@ -381,16 +381,24 @@ def _analyze_sync(frames: list[dict], target: str,
         else:
             descriptions.append(f"Frame {i+1} ({frame['time']:.0f}s): {desc}")
 
-    # Отказываем ТОЛЬКО если игрок реально отсутствует: GPT явно сказал
-    # "не тот игрок" в большинстве кадров И почти ничего полезного не нашлось.
-    # Так мы не режем реальные видео где игрок просто не в каждом кадре.
+    # Отказываем ТОЛЬКО если игрок реально отсутствует на видео:
+    # GPT явно сказал "не тот игрок" в большинстве кадров.
+    # PAUSE (отдых) и NOT VISIBLE НЕ считаются за отсутствие игрока —
+    # это нормальные моменты, просто их не оцениваем как технику.
     total = len(frames)
-    if not_found_count >= total * 0.6 and len(descriptions) < 2:
+    if total > 0 and not_found_count >= total * 0.7:
         return "TARGET_NOT_FOUND"
 
-    # Если совсем ничего не описано (например все кадры пустые) — тоже отказ
+    # Если набралось хотя бы одно игровое описание — анализируем по нему.
+    # Если совсем ничего (только паузы) — берём что есть, но не отказываем,
+    # а просим GPT работать с тем что было видно.
     if not descriptions:
-        return "TARGET_NOT_FOUND"
+        # Все кадры — паузы или не видно. Не отказываем, но честно помечаем
+        # что игровых моментов мало. GPT сделает что сможет.
+        descriptions.append(
+            "Frame info: most frames show non-active moments (rest/pauses). "
+            "Analyze any visible playing technique and positioning."
+        )
 
     report_prompt = t(lang, "report_prompt",
                       n=len(descriptions), name=name, target=target,

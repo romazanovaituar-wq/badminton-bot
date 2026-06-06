@@ -228,7 +228,7 @@ def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
             prev_gray = gray
         idx += 1
 
-    if len(motion) >= 8:
+    if len(motion) >= 6:
         cap.release()
         logger.info("Извлечено %d кадров (motion)", len(motion))
         return motion
@@ -241,19 +241,38 @@ def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
         except OSError:
             pass
 
+    # Берём кадров больше чем нужно, потом оставим самые "динамичные"
     uniform: list[dict] = []
+    candidates: list[tuple] = []  # (frame, time, motion_score)
+    prev_small = None
     if total > 0:
-        step = max(1, total // MAX_FRAMES)
+        # Шаг мельче — набираем больше кандидатов для отбора по движению
+        step = max(1, total // (MAX_FRAMES * 2))
         for i in range(0, total, step):
-            if len(uniform) >= MAX_FRAMES:
-                break
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ret, frame = cap.read()
-            if ret:
-                uniform.append(_save_frame(frame, output_dir, len(uniform), i / fps))
+            if not ret:
+                continue
+            # Оценка движения относительно предыдущего кадра
+            small = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+            score = 0.0
+            if prev_small is not None:
+                score = cv2.absdiff(small, prev_small).mean()
+            prev_small = small
+            candidates.append((frame, i / fps, score))
+
+    if candidates:
+        # Сортируем по убыванию движения, берём топ MAX_FRAMES самых активных,
+        # затем восстанавливаем хронологический порядок по времени.
+        # Так в анализ попадают игровые моменты, а не паузы/отдых.
+        active = sorted(candidates, key=lambda c: c[2], reverse=True)[:MAX_FRAMES]
+        active.sort(key=lambda c: c[1])  # по времени
+        for frame, t_sec, _score in active:
+            uniform.append(_save_frame(frame, output_dir, len(uniform), t_sec))
+
     if len(uniform) >= 3:
         cap.release()
-        logger.info("Извлечено %d кадров (uniform)", len(uniform))
+        logger.info("Извлечено %d кадров (uniform+motion-фильтр)", len(uniform))
         return uniform
 
     # --- Уровень 3: берём вообще всё что есть ---
@@ -337,6 +356,7 @@ def _analyze_sync(frames: list[dict], target: str,
     frame_prompt = t(lang, "frame_prompt", target=target)
     descriptions: list[str] = []
     not_found_count = 0
+    pause_count = 0
 
     for i, frame in enumerate(frames):
         resp = client.chat.completions.create(
@@ -356,6 +376,8 @@ def _analyze_sync(frames: list[dict], target: str,
             not_found_count += 1
         elif "NOT VISIBLE" in up:
             pass  # в этом кадре не видно — нормально, просто пропускаем
+        elif up.strip().startswith("PAUSE"):
+            pause_count += 1  # неигровой момент (отдых/пауза) — не оцениваем технику
         else:
             descriptions.append(f"Frame {i+1} ({frame['time']:.0f}s): {desc}")
 

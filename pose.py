@@ -110,6 +110,8 @@ def analyze_frames(frame_paths: list[str]) -> dict | None:
     stance_widths = []
     torso_leans = []
     centers = []  # центр массы (бёдра) для оценки движения
+    arm_reaches = []   # вынос бьющей руки вверх (запястье выше плеча)
+    balances = []      # симметрия плеч (горизонтальность = баланс)
     found = 0
 
     try:
@@ -161,6 +163,18 @@ def analyze_frames(frame_paths: list[str]) -> dict | None:
                     lean = math.degrees(math.atan2(dx, dy))
                     torso_leans.append(lean)
 
+                    # Вынос руки вверх: насколько запястье выше плеча
+                    # (в координатах экрана меньше Y = выше). Положительное = рука поднята.
+                    wrist_y = pt(L.RIGHT_WRIST)[1]
+                    shoulder_y = pt(L.RIGHT_SHOULDER)[1]
+                    reach = (shoulder_y - wrist_y)  # >0 если рука выше плеча
+                    arm_reaches.append(reach)
+
+                    # Баланс: насколько плечи горизонтальны (разница высот плеч).
+                    # Меньше разница = ровнее стойка = лучше баланс.
+                    sh_diff = abs(pt(L.LEFT_SHOULDER)[1] - pt(L.RIGHT_SHOULDER)[1])
+                    balances.append(sh_diff)
+
                     centers.append(hip_mid)
                 except Exception:
                     continue
@@ -185,6 +199,14 @@ def analyze_frames(frame_paths: list[str]) -> dict | None:
     def avg(lst):
         return round(sum(lst) / len(lst), 1) if lst else None
 
+    # Вынос руки: доля кадров где рука поднята выше плеча (хорошо для ударов сверху)
+    arm_up_ratio = None
+    if arm_reaches:
+        arm_up_ratio = round(sum(1 for r in arm_reaches if r > 0) / len(arm_reaches), 2)
+
+    # Баланс: средняя разница высот плеч (меньше = ровнее). В процентах.
+    balance = round(avg(balances) * 100, 1) if balances else None
+
     return {
         "frames_with_pose": found,
         "knee_flex": avg(knee_angles),
@@ -192,6 +214,8 @@ def analyze_frames(frame_paths: list[str]) -> dict | None:
         "stance_width": round(avg(stance_widths) * 100, 1) if stance_widths else None,
         "torso_lean": avg(torso_leans),
         "movement": round(movement * 100, 2),
+        "arm_up_ratio": arm_up_ratio,
+        "balance": balance,
     }
 
 
@@ -227,3 +251,61 @@ def metrics_summary(m: dict, lang: str = "ru") -> str:
         else:
             parts.append("умеренная активность перемещений")
     return "; ".join(parts)
+
+
+def compute_scores(m: dict) -> dict | None:
+    """
+    Вычисляет баллы (0-100) НАПРЯМУЮ из измеренных метрик.
+    Это делает оценки ВОСПРОИЗВОДИМЫМИ — одно видео всегда даёт один балл,
+    потому что баллы выводятся из физических измерений, а не из догадок.
+
+    Возвращает баллы по тем категориям, что можно измерить позой.
+    Тактику не считаем — её скелетом не измеришь (оставляем GPT).
+    """
+    if not m:
+        return None
+
+    def clamp(v):
+        return max(20, min(95, int(round(v))))
+
+    scores = {}
+
+    # FOOTWORK (работа ног): согнутые колени + активность перемещений.
+    # Идеальный сгиб колена в бадминтоне ~120-150° (готовность к рывку).
+    knee = m.get("knee_flex")
+    mv = m.get("movement", 0) or 0
+    if knee is not None:
+        # 120-150° = отлично (90), прямые >170 = плохо (40)
+        if knee <= 150:
+            knee_score = 90 - abs(135 - knee) * 0.8
+        else:
+            knee_score = 90 - (knee - 150) * 1.8  # штраф за прямые ноги
+        # активность добавляет до +15
+        move_bonus = min(15, mv * 2)
+        scores["footwork"] = clamp(knee_score + move_bonus - 7)
+
+    # TECHNIQUE (техника): вынос руки + угол локтя + наклон корпуса.
+    elbow = m.get("elbow_angle")
+    arm = m.get("arm_up_ratio")
+    if elbow is not None:
+        # согнутый локоть при замахе (~90-140) хорошо
+        elbow_score = 85 - abs(115 - elbow) * 0.6
+        if arm is not None:
+            elbow_score += arm * 15  # рука часто поднята = +
+        scores["technique"] = clamp(elbow_score)
+
+    # POSITIONING (позиционирование): наклон корпуса (вертикальный = собран).
+    lean = m.get("torso_lean")
+    if lean is not None:
+        # умеренный наклon 5-20° норм, сильный >30 плохо
+        pos_score = 88 - max(0, lean - 18) * 1.5
+        scores["positioning"] = clamp(pos_score)
+
+    # RECOVERY (восстановление/баланс): симметрия + стабильность стойки.
+    bal = m.get("balance")
+    if bal is not None:
+        # меньше разница плеч = ровнее = лучше. bal в процентах.
+        rec_score = 90 - bal * 2.5
+        scores["recovery"] = clamp(rec_score)
+
+    return scores if scores else None

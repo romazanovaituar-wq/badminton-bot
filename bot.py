@@ -398,13 +398,17 @@ def _analyze_sync(frames: list[dict], target: str,
     # Считаем метрики позы по кадрам и даём GPT как объективные данные,
     # чтобы оценка опиралась на измерения, а не только на догадки по картинкам.
     pose_note = ""
+    measured_scores = None
     try:
         frame_paths = [f["path"] for f in frames]
         metrics = pose.analyze_frames(frame_paths)
         if metrics:
             summary = pose.metrics_summary(metrics, lang)
+            measured_scores = pose.compute_scores(metrics)
             if summary:
                 logger.info("Pose-метрики: %s", summary)
+                if measured_scores:
+                    logger.info("Измеренные баллы: %s", measured_scores)
                 pose_note = (
                     "\n\nОБЪЕКТИВНЫЕ ИЗМЕРЕНИЯ позы игрока (данные компьютерного "
                     "зрения, опирайся на них при оценке техники и работы ног): "
@@ -421,7 +425,49 @@ def _analyze_sync(frames: list[dict], target: str,
         max_tokens=1500,
         messages=[{"role": "user", "content": report_prompt}],
     )
-    return resp.choices[0].message.content
+    report = resp.choices[0].message.content or ""
+
+    # Переопределяем баллы ИЗМЕРЕННЫМИ значениями там где они есть.
+    # Это делает footwork/technique/positioning/recovery воспроизводимыми.
+    if measured_scores:
+        report = _apply_measured_scores(report, measured_scores)
+
+    return report
+
+
+def _apply_measured_scores(report: str, measured: dict) -> str:
+    """
+    Заменяет в строке SCORES баллы на измеренные (footwork/technique/
+    positioning/recovery). Tactics и overall оставляем от GPT (их не измеришь).
+    Формат строки: SCORES: overall|footwork|technique|tactics|positioning|recovery
+    """
+    import re
+    lines = report.split("\n")
+    for idx, line in enumerate(lines):
+        mt = re.match(r"\s*SCORES:\s*(.+)", line, re.IGNORECASE)
+        if not mt:
+            continue
+        parts = [p.strip() for p in mt.group(1).split("|")]
+        if len(parts) < 6:
+            break
+        try:
+            nums = [int(re.sub(r"[^0-9]", "", p) or 0) for p in parts]
+        except ValueError:
+            break
+        # nums: [overall, footwork, technique, tactics, positioning, recovery]
+        if "footwork" in measured:
+            nums[1] = measured["footwork"]
+        if "technique" in measured:
+            nums[2] = measured["technique"]
+        if "positioning" in measured:
+            nums[4] = measured["positioning"]
+        if "recovery" in measured:
+            nums[5] = measured["recovery"]
+        # overall пересчитываем как среднее всех пяти
+        nums[0] = int(round((nums[1] + nums[2] + nums[3] + nums[4] + nums[5]) / 5))
+        lines[idx] = "SCORES: " + "|".join(str(n) for n in nums)
+        break
+    return "\n".join(lines)
 
 
 # ==================================================

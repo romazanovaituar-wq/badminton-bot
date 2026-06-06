@@ -41,11 +41,23 @@ STAR_PACKAGES = {
     "pack_20": {"stars": 1000, "credits": 20, "title": "20 анализов"},
 }
 
+# Реквизиты для ручной оплаты (Казахстан, Kaspi).
+# ВПИШИ свой номер Kaspi вместо заглушки ниже.
+KASPI_NUMBER = os.environ.get("KASPI_NUMBER", "+7 XXX XXX XX XX")
+KASPI_NAME = os.environ.get("KASPI_NAME", "Aituar")
+# Цены в тенге за пакеты (примерно $1/анализ при курсе ~480₸)
+KZT_PRICES = {
+    "1 анализ": "500₸",
+    "5 анализов": "2000₸",
+    "20 анализов": "7000₸",
+}
+
 MOTION_THRESHOLD = 12
 MAX_FRAMES       = 25
 ANALYSIS_TIMEOUT = 600  # 10 минут максимум на анализ
 MAX_VIDEO_MB     = 200
 ADMIN_ID         = 942577691  # Telegram ID администратора
+ADMIN_USERNAME   = os.environ.get("ADMIN_USERNAME", "@N1world1N")  # для связи по оплате
 
 
 def _is_admin(user_id: int) -> bool:
@@ -104,6 +116,8 @@ def buy_keyboard(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             f"⭐ {STAR_PACKAGES['pack_20']['stars']} — {t(lang, 'pack_20')}",
             callback_data="buy_pack_20")],
+        [InlineKeyboardButton(
+            t(lang, "btn_kaspi"), callback_data="pay_kaspi")],
     ])
 
 
@@ -721,6 +735,24 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(t(lang, "buy_text"), reply_markup=buy_keyboard(lang))
 
 
+async def kaspi_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает реквизиты Kaspi, цены в тенге и ID пользователя для ручной оплаты."""
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    lang = db.get_lang(uid)
+    prices_text = "\n".join(
+        f"   {name} — {price}" for name, price in KZT_PRICES.items()
+    )
+    text = t(lang, "kaspi_info",
+             prices=prices_text,
+             kaspi=KASPI_NUMBER,
+             name=KASPI_NAME,
+             uid=uid,
+             admin=ADMIN_USERNAME)
+    await q.message.reply_text(text)
+
+
 async def send_invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пользователь выбрал пакет — выставляем счёт в Telegram Stars."""
     q = update.callback_query
@@ -1281,6 +1313,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(lang_callback, pattern="^lang_"))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^go_buy$"))
     # Оплата через Telegram Stars
+    app.add_handler(CallbackQueryHandler(kaspi_callback, pattern="^pay_kaspi$"))
     app.add_handler(CallbackQueryHandler(send_invoice_callback, pattern="^buy_pack_"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))

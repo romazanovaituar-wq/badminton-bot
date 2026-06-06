@@ -898,7 +898,7 @@ async def identify_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     lang = db.get_lang(q.from_user.id)
-    await q.edit_message_text(t(lang, "ask_shirt"))
+    await q.message.reply_text(t(lang, "ask_shirt"))
     return SHIRT_COLOR
 
 
@@ -911,7 +911,7 @@ async def identify_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(t(lang, "btn_near"), callback_data="pos_near")],
         [InlineKeyboardButton(t(lang, "btn_far"), callback_data="pos_far")],
     ])
-    await q.edit_message_text(t(lang, "ask_position"), reply_markup=kb)
+    await q.message.reply_text(t(lang, "ask_position"), reply_markup=kb)
     return POSITION
 
 
@@ -921,7 +921,7 @@ async def identify_both(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     lang = db.get_lang(q.from_user.id)
     context.user_data["identify_mode"] = "both"
-    await q.edit_message_text(t(lang, "ask_video"))
+    await q.message.reply_text(t(lang, "ask_video"))
     return VIDEO
 
 
@@ -941,7 +941,7 @@ async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = db.get_lang(q.from_user.id)
     context.user_data["identify_mode"] = "position"
     context.user_data["position"] = "near" if q.data == "pos_near" else "far"
-    await q.edit_message_text(t(lang, "ask_video"))
+    await q.message.reply_text(t(lang, "ask_video"))
     return VIDEO
 
 

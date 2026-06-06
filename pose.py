@@ -331,3 +331,71 @@ def level_from_scores(scores: dict) -> str:
     if avg >= 50:
         return "любитель"
     return "начинающий"
+
+
+def render_skeleton(frame_paths: list[str], out_path: str) -> str | None:
+    """
+    Берёт кадр где поза найдена наиболее уверенно, рисует на нём скелет
+    MediaPipe (точки суставов + соединения) и сохраняет картинку.
+    Возвращает путь к картинке или None если не удалось.
+
+    Это визуальное доказательство работы CV — вставляется в PDF.
+    """
+    if not _MP_AVAILABLE:
+        return None
+    try:
+        import cv2
+        mp_pose = mp.solutions.pose
+        mp_draw = mp.solutions.drawing_utils
+        mp_styles = mp.solutions.drawing_styles
+    except Exception as e:
+        logger.warning("render_skeleton: импорт не удался: %s", e)
+        return None
+
+    best_img = None
+    best_landmarks = None
+    best_score = -1.0
+
+    try:
+        with mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            min_detection_confidence=0.5,
+        ) as pose:
+            for path in frame_paths:
+                try:
+                    img = cv2.imread(path)
+                    if img is None:
+                        continue
+                    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    res = pose.process(rgb)
+                    if not res.pose_landmarks:
+                        continue
+                    # Оцениваем "качество" позы — средняя видимость точек
+                    vis = [lm.visibility for lm in res.pose_landmarks.landmark]
+                    score = sum(vis) / len(vis) if vis else 0
+                    if score > best_score:
+                        best_score = score
+                        best_img = img.copy()
+                        best_landmarks = res.pose_landmarks
+                except Exception:
+                    continue
+
+        if best_img is None or best_landmarks is None:
+            return None
+
+        # Рисуем скелет на лучшем кадре
+        mp_draw.draw_landmarks(
+            best_img,
+            best_landmarks,
+            mp_pose.POSE_CONNECTIONS,
+            landmark_drawing_spec=mp_draw.DrawingSpec(
+                color=(90, 190, 240), thickness=3, circle_radius=4),
+            connection_drawing_spec=mp_draw.DrawingSpec(
+                color=(0, 200, 150), thickness=3),
+        )
+        cv2.imwrite(out_path, best_img)
+        return out_path
+    except Exception as e:
+        logger.warning("render_skeleton: ошибка: %s", e)
+        return None

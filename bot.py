@@ -570,7 +570,8 @@ def _score_color(value: int) -> tuple:
 
 
 def _generate_pdf_sync(report: str, name: str, frames_count: int,
-                       lang: str, out_path: str) -> str:
+                       lang: str, out_path: str,
+                       skeleton_path: str = None) -> str:
     _ensure_fonts()
 
     # Извлекаем оценки игрока (если GPT их выдал)
@@ -637,6 +638,26 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
              f"{datetime.now().strftime('%d.%m.%Y')}   ·   проанализировано кадров: {frames_count}",
              new_x="LMARGIN", new_y="NEXT")
     pdf.ln(8)
+
+    # ====== СКЕЛЕТ (визуальное доказательство CV) ======
+    if skeleton_path and os.path.exists(skeleton_path):
+        try:
+            cap = {"ru": "AI-анализ позы (компьютерное зрение)",
+                   "kz": "AI-поза талдауы (компьютерлік көру)",
+                   "en": "AI pose analysis (computer vision)"}.get(lang, "")
+            pdf.set_font("Roboto", "B", 11)
+            pdf.set_text_color(*GOLD)
+            pdf.cell(0, 7, cap, new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+            # Вставляем картинку по центру, ширина ~90мм
+            img_w = 90
+            x = (pdf.w - img_w) / 2
+            y = pdf.get_y()
+            pdf.image(skeleton_path, x=x, y=y, w=img_w)
+            # Сдвигаем курсор ниже картинки (высота ~ пропорция, берём с запасом)
+            pdf.set_y(y + img_w * 0.66 + 6)
+        except Exception:
+            pass
 
     # ====== БЛОК ОЦЕНОК ======
     if scores:
@@ -1183,9 +1204,21 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # PDF
         await msg.edit_text(t(lang, "generating"))
+        # Генерируем картинку скелета (визуальное доказательство CV)
+        skeleton_path = None
+        try:
+            frame_paths = [f["path"] for f in frames]
+            sk = f"{tmpdir}/skeleton.jpg"
+            skeleton_path = await loop.run_in_executor(
+                None, pose.render_skeleton, frame_paths, sk)
+        except Exception as e:
+            logger.warning("Скелет не отрисован: %s", e)
+            skeleton_path = None
+
         pdf_path = f"{tmpdir}/report.pdf"
         await loop.run_in_executor(
-            None, _generate_pdf_sync, report, name, len(frames), lang, pdf_path)
+            None, _generate_pdf_sync, report, name, len(frames), lang, pdf_path,
+            skeleton_path)
 
         db.log_analysis(uid, len(frames), target_desc[:100])
         remaining = db.get_credits(uid)

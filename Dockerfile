@@ -1,6 +1,5 @@
-# RallyIQ bot — Dockerfile (замена nixpacks)
-# Шаг 1: собираем текущий бот без MediaPipe, проверяем что миграция работает.
-# Системные библиотеки (libGL и др.) уже включены — фундамент готов под CV.
+# RallyIQ bot — Dockerfile
+# Шаг 2: MediaPipe добавлен. Системные библиотеки (libGL и др.) для OpenCV+MediaPipe.
 
 FROM python:3.11-slim
 

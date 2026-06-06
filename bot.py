@@ -21,6 +21,7 @@ from fpdf import FPDF
 import cv2
 
 import db
+import pose
 from texts import t, TEXTS
 
 # ==================================================
@@ -1352,6 +1353,8 @@ async def post_init(app: Application) -> None:
 def main() -> None:
     db.init_pool()
     db.init_schema()
+    # Проверка MediaPipe: логирует встал ли он. Не ломает бота при сбое.
+    pose.log_status()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 

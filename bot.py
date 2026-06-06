@@ -735,6 +735,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         TEXTS["ru"]["choose_lang"], reply_markup=keyboard)
 
 
+async def see_demo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает новичку как работает бот (трейлер по шагам) + пример отчёта."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    # Трейлер: шаги работы
+    await q.message.reply_text(t(lang, "demo_steps"))
+    # Пример отчёта — что человек получит
+    await q.message.reply_text(t(lang, "demo_report"),
+                               reply_markup=menu_keyboard(lang))
+
+
 async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -744,7 +756,12 @@ async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     credits = db.get_credits(q.from_user.id)
     await q.edit_message_text(
         t(lang, "welcome", name=q.from_user.first_name, credits=credits))
-    await q.message.reply_text(t(lang, "onboarding"), reply_markup=menu_keyboard(lang))
+    # Онбординг с кнопкой "пример отчёта" — новичок сразу видит что получит
+    demo_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "btn_see_demo"), callback_data="see_demo")],
+    ])
+    await q.message.reply_text(t(lang, "onboarding"), reply_markup=demo_kb)
+    await q.message.reply_text(t(lang, "menu_hint"), reply_markup=menu_keyboard(lang))
 
 
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1470,6 +1487,7 @@ def main() -> None:
     # Роутер кнопок меню — ловит buy/balance/language/help вне диалога
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
     app.add_handler(CallbackQueryHandler(lang_callback, pattern="^lang_"))
+    app.add_handler(CallbackQueryHandler(see_demo_callback, pattern="^see_demo$"))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^go_buy$"))
     # Оплата через Telegram Stars
     app.add_handler(CallbackQueryHandler(kaspi_callback, pattern="^pay_kaspi$"))

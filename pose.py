@@ -112,6 +112,7 @@ def analyze_frames(frame_paths: list[str]) -> dict | None:
     centers = []  # центр массы (бёдра) для оценки движения
     arm_reaches = []   # вынос бьющей руки вверх (запястье выше плеча)
     balances = []      # симметрия плеч (горизонтальность = баланс)
+    leg_stretches = [] # растяжка ног (расстояние лодыжка-лодыжка = глубина выпада)
     found = 0
 
     try:
@@ -151,6 +152,9 @@ def analyze_frames(frame_paths: list[str]) -> dict | None:
                     ra = pt(L.RIGHT_ANKLE)
                     stance = abs(la[0] - ra[0])
                     stance_widths.append(stance)
+                    # Растяжка ног: полное расстояние между лодыжками (выпад)
+                    leg_stretch = ((la[0]-ra[0])**2 + (la[1]-ra[1])**2) ** 0.5
+                    leg_stretches.append(leg_stretch)
 
                     # Наклон корпуса: угол линии плечи-бёдра от вертикали
                     sh_mid = ((pt(L.LEFT_SHOULDER)[0] + pt(L.RIGHT_SHOULDER)[0]) / 2,
@@ -216,6 +220,12 @@ def analyze_frames(frame_paths: list[str]) -> dict | None:
         "movement": round(movement * 100, 2),
         "arm_up_ratio": arm_up_ratio,
         "balance": balance,
+        "leg_stretch": round(avg(leg_stretches), 3) if leg_stretches else None,
+        "total_distance": round(sum(
+            ((centers[i][0]-centers[i-1][0])**2 + (centers[i][1]-centers[i-1][1])**2) ** 0.5
+            for i in range(1, len(centers))
+        ) * 100, 1) if len(centers) >= 2 else 0.0,
+        "_centers": centers,  # координаты для тепловой карты (служебное)
     }
 
 
@@ -250,6 +260,12 @@ def metrics_summary(m: dict, lang: str = "ru") -> str:
             parts.append("активные перемещения по корту")
         else:
             parts.append("умеренная активность перемещений")
+    ls = m.get("leg_stretch")
+    if ls is not None:
+        if ls > 0.25:
+            parts.append("широкие выпады (хорошая растяжка ног)")
+        elif ls < 0.1:
+            parts.append("узкая стойка, мало выпадов")
     return "; ".join(parts)
 
 
@@ -398,4 +414,64 @@ def render_skeleton(frame_paths: list[str], out_path: str) -> str | None:
         return out_path
     except Exception as e:
         logger.warning("render_skeleton: ошибка: %s", e)
+        return None
+
+
+def render_heatmap(centers: list, out_path: str) -> str | None:
+    """
+    Рисует тепловую карту перемещений игрока по корту на основе его
+    позиций (центров) в кадрах. Показывает где игрок проводил больше времени.
+    Возвращает путь к картинке или None.
+
+    centers — список (x, y) нормализованных координат (0..1) от MediaPipe.
+    """
+    if not centers or len(centers) < 3:
+        return None
+    try:
+        import numpy as np
+        import cv2
+    except Exception as e:
+        logger.warning("render_heatmap: импорт не удался: %s", e)
+        return None
+
+    try:
+        W, H = 360, 480  # вертикальный корт
+        # Пустое поле (тёмный фон под тему PDF)
+        canvas = np.full((H, W, 3), (33, 27, 21), dtype=np.uint8)  # BGR ~ #121621
+
+        # Рисуем разметку корта (простую)
+        line_color = (90, 90, 90)
+        cv2.rectangle(canvas, (30, 30), (W-30, H-30), line_color, 2)
+        cv2.line(canvas, (30, H//2), (W-30, H//2), (70, 120, 160), 2)  # сетка
+        cv2.line(canvas, (W//2, 30), (W//2, H-30), line_color, 1)       # центр
+
+        # Накапливаем тепло в сетке
+        heat = np.zeros((H, W), dtype=np.float32)
+        for (x, y) in centers:
+            px = int(30 + x * (W - 60))
+            py = int(30 + y * (H - 60))
+            px = max(0, min(W-1, px))
+            py = max(0, min(H-1, py))
+            cv2.circle(heat, (px, py), 28, 1.0, -1)
+
+        # Размытие для плавности
+        heat = cv2.GaussianBlur(heat, (0, 0), 18)
+        if heat.max() > 0:
+            heat = heat / heat.max()
+
+        # Накладываем цветовую карту (синий→жёлтый→красный)
+        heat_u8 = (heat * 255).astype(np.uint8)
+        colored = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
+        # Смешиваем с полем там где есть тепло
+        mask = (heat > 0.05).astype(np.float32)[..., None]
+        canvas = (canvas * (1 - mask * 0.65) + colored * (mask * 0.65)).astype(np.uint8)
+
+        # Перерисуем линии поверх
+        cv2.rectangle(canvas, (30, 30), (W-30, H-30), line_color, 2)
+        cv2.line(canvas, (30, H//2), (W-30, H//2), (70, 120, 160), 2)
+
+        cv2.imwrite(out_path, canvas)
+        return out_path
+    except Exception as e:
+        logger.warning("render_heatmap: ошибка: %s", e)
         return None

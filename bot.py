@@ -571,7 +571,9 @@ def _score_color(value: int) -> tuple:
 
 def _generate_pdf_sync(report: str, name: str, frames_count: int,
                        lang: str, out_path: str,
-                       skeleton_path: str = None) -> str:
+                       skeleton_path: str = None,
+                       heatmap_path: str = None,
+                       extra_metrics: dict = None) -> str:
     _ensure_fonts()
 
     # Извлекаем оценки игрока (если GPT их выдал)
@@ -656,6 +658,64 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
             pdf.image(skeleton_path, x=x, y=y, w=img_w)
             # Сдвигаем курсор ниже картинки (высота ~ пропорция, берём с запасом)
             pdf.set_y(y + img_w * 0.66 + 6)
+        except Exception:
+            pass
+
+    # ====== ТЕПЛОВАЯ КАРТА ПЕРЕМЕЩЕНИЙ ======
+    if heatmap_path and os.path.exists(heatmap_path):
+        try:
+            cap = {"ru": "Карта перемещений по корту",
+                   "kz": "Корт бойынша қозғалыс картасы",
+                   "en": "Court movement heatmap"}.get(lang, "")
+            pdf.set_font("Roboto", "B", 11)
+            pdf.set_text_color(*GOLD)
+            pdf.cell(0, 7, cap, new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+            img_w = 60
+            x = (pdf.w - img_w) / 2
+            y = pdf.get_y()
+            pdf.image(heatmap_path, x=x, y=y, w=img_w)
+            pdf.set_y(y + img_w * 1.33 + 6)
+        except Exception:
+            pass
+
+    # ====== БЛОК ИЗМЕРЕННЫХ МЕТРИК ======
+    if extra_metrics:
+        try:
+            labels = {
+                "ru": {"title": "ИЗМЕРЕНИЯ (компьютерное зрение)",
+                       "dist": "Пройдено на корте", "stretch": "Растяжка выпадов",
+                       "knee": "Сгиб колен", "active": "Активность"},
+                "kz": {"title": "ӨЛШЕМДЕР (компьютерлік көру)",
+                       "dist": "Кортта жүгірді", "stretch": "Шалқу тереңдігі",
+                       "knee": "Тізе бүгу", "active": "Белсенділік"},
+                "en": {"title": "MEASUREMENTS (computer vision)",
+                       "dist": "Court distance", "stretch": "Lunge stretch",
+                       "knee": "Knee flex", "active": "Activity"},
+            }.get(lang, None)
+            if labels:
+                pdf.set_font("Roboto", "B", 11)
+                pdf.set_text_color(*GOLD)
+                pdf.cell(0, 7, labels["title"], new_x="LMARGIN", new_y="NEXT")
+                pdf.ln(1)
+                pdf.set_font("Roboto", "", 10)
+                pdf.set_text_color(220, 220, 220)
+                dist = extra_metrics.get("total_distance")
+                knee = extra_metrics.get("knee_flex")
+                ls = extra_metrics.get("leg_stretch")
+                mv = extra_metrics.get("movement")
+                rows = []
+                if dist is not None:
+                    rows.append(f"{labels['dist']}: ~{dist} усл.ед.")
+                if ls is not None:
+                    rows.append(f"{labels['stretch']}: {round(ls*100)}%")
+                if knee is not None:
+                    rows.append(f"{labels['knee']}: {knee}°")
+                if mv is not None:
+                    rows.append(f"{labels['active']}: {mv}")
+                for r in rows:
+                    pdf.cell(0, 6, "  • " + r, new_x="LMARGIN", new_y="NEXT")
+                pdf.ln(4)
         except Exception:
             pass
 
@@ -1204,21 +1264,31 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # PDF
         await msg.edit_text(t(lang, "generating"))
-        # Генерируем картинку скелета (визуальное доказательство CV)
+        # Генерируем визуалы CV: скелет + тепловую карту + метрики
         skeleton_path = None
+        heatmap_path = None
+        extra_metrics = None
         try:
             frame_paths = [f["path"] for f in frames]
             sk = f"{tmpdir}/skeleton.jpg"
             skeleton_path = await loop.run_in_executor(
                 None, pose.render_skeleton, frame_paths, sk)
+            # Метрики (для тепловой карты и блока цифр)
+            m = await loop.run_in_executor(None, pose.analyze_frames, frame_paths)
+            if m:
+                extra_metrics = m
+                centers = m.get("_centers")
+                if centers:
+                    hm = f"{tmpdir}/heatmap.jpg"
+                    heatmap_path = await loop.run_in_executor(
+                        None, pose.render_heatmap, centers, hm)
         except Exception as e:
-            logger.warning("Скелет не отрисован: %s", e)
-            skeleton_path = None
+            logger.warning("Визуалы CV не отрисованы: %s", e)
 
         pdf_path = f"{tmpdir}/report.pdf"
         await loop.run_in_executor(
             None, _generate_pdf_sync, report, name, len(frames), lang, pdf_path,
-            skeleton_path)
+            skeleton_path, heatmap_path, extra_metrics)
 
         db.log_analysis(uid, len(frames), target_desc[:100])
         remaining = db.get_credits(uid)

@@ -64,7 +64,7 @@ ADMIN_USERNAME   = os.environ.get("ADMIN_USERNAME", "@N1world1N")  # для св
 def _is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
-GAME_TYPE, IDENTIFY, SHIRT_COLOR, POSITION, VIDEO = range(5)
+GAME_TYPE, IDENTIFY, SHIRT_COLOR, POSITION, VIDEO, ORIENT = range(6)
 
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
 
@@ -190,7 +190,9 @@ def _download_gdrive(url: str, dest_path: str) -> bool:
 def _save_frame(frame, output_dir: str, index: int, time_s: float,
                 rotation: int = 0) -> dict:
     """Сохраняет кадр с ресайзом + коррекцией ориентации."""
-    # Корректируем ротацию (вертикальные видео с телефона)
+    # Поворот по метаданным видео (надёжно). Спорные случаи (нет метаданных,
+    # но кадр вертикальный) решаются ВОПРОСОМ пользователю до анализа —
+    # см. логику в process_video, здесь только применяем известный угол.
     if rotation:
         frame = _auto_rotate_frame(frame, rotation)
     h, w = frame.shape[:2]
@@ -245,7 +247,7 @@ def _auto_rotate_frame(frame, rotation: int):
     return frame  # 0 или неизвестный — не трогаем
 
 
-def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
+def _extract_frames_sync(video_path: str, output_dir: str, force_rotate: bool = False) -> list[dict]:
     """
     Надёжное извлечение кадров с трёхуровневым фоллбэком:
     1) кадры с движением (умный выбор)
@@ -258,6 +260,9 @@ def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     # Определяем ротацию видео (телефоны часто снимают вертикально)
     rotation = _get_video_rotation(video_path)
+    if not rotation and force_rotate:
+        # Пользователь сказал что снимал вертикально — поворачиваем на 90°
+        rotation = 90
     if rotation:
         logger.info("Видео ротация: %d° — кадры будут повёрнуты", rotation)
 
@@ -696,6 +701,8 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
     # ====== СКЕЛЕТ (визуальное доказательство CV) ======
     if skeleton_path and os.path.exists(skeleton_path):
         try:
+            if pdf.get_y() > pdf.h - 110:
+                pdf.add_page()
             cap = {"ru": "AI-анализ позы (компьютерное зрение)",
                    "kz": "AI-поза талдауы (компьютерлік көру)",
                    "en": "AI pose analysis (computer vision)"}.get(lang, "")
@@ -723,6 +730,9 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
     # ====== ТЕПЛОВАЯ КАРТА ПЕРЕМЕЩЕНИЙ ======
     if heatmap_path and os.path.exists(heatmap_path):
         try:
+            # Карта высокая (~80мм). Если мало места — новая страница.
+            if pdf.get_y() > pdf.h - 100:
+                pdf.add_page()
             cap = {"ru": "Карта перемещений по корту",
                    "kz": "Корт бойынша қозғалыс картасы",
                    "en": "Court movement heatmap"}.get(lang, "")
@@ -1188,8 +1198,8 @@ async def identify_both(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     lang = db.get_lang(q.from_user.id)
     context.user_data["identify_mode"] = "both"
-    await q.message.reply_text(t(lang, "ask_video"))
-    return VIDEO
+    await _ask_orientation(q.message, lang)
+    return ORIENT
 
 
 async def get_shirt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1197,8 +1207,8 @@ async def get_shirt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = db.get_lang(uid)
     context.user_data["identify_mode"] = "color"
     context.user_data["shirt"] = update.message.text.strip()[:100]
-    await update.message.reply_text(t(lang, "ask_video"))
-    return VIDEO
+    await _ask_orientation(update.message, lang)
+    return ORIENT
 
 
 async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1214,10 +1224,39 @@ async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(t(lang, "ask_doubles_color"))
         return SHIRT_COLOR
     else:
-        # Одиночка по позиции — сразу к видео
+        # Одиночка по позиции — спрашиваем ориентацию
         context.user_data["identify_mode"] = "position"
-        await q.message.reply_text(t(lang, "ask_video"))
-        return VIDEO
+        await _ask_orientation(q.message, lang)
+        return ORIENT
+
+
+async def _ask_orientation(message, lang):
+    """Показывает вопрос об ориентации видео перед отправкой."""
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "btn_orient_h"), callback_data="orient_h")],
+        [InlineKeyboardButton(t(lang, "btn_orient_v"), callback_data="orient_v")],
+    ])
+    await message.reply_text(t(lang, "ask_orientation"), reply_markup=kb)
+
+
+async def orient_horizontal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Видео снято горизонтально — поворот не нужен."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    context.user_data["force_rotate"] = False
+    await q.message.reply_text(t(lang, "ask_video"))
+    return VIDEO
+
+
+async def orient_vertical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Видео снято вертикально — повернём кадры при нарезке."""
+    q = update.callback_query
+    await q.answer()
+    lang = db.get_lang(q.from_user.id)
+    context.user_data["force_rotate"] = True
+    await q.message.reply_text(t(lang, "ask_video"))
+    return VIDEO
 
 
 async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1278,8 +1317,9 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Нарезка кадров
         await msg.edit_text(t(lang, "extracting"))
+        force_rotate = context.user_data.get("force_rotate", False)
         frames = await loop.run_in_executor(
-            None, _extract_frames_sync, video_path, frames_dir)
+            None, _extract_frames_sync, video_path, frames_dir, force_rotate)
         if len(frames) < 3:
             logger.warning("Мало кадров (%d) для user %s", len(frames), uid)
             await msg.edit_text(t(lang, "err_frames"))
@@ -1693,6 +1733,10 @@ def main() -> None:
             SHIRT_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_shirt)],
             POSITION: [
                 CallbackQueryHandler(get_position, pattern="^pos_(near|far)$"),
+            ],
+            ORIENT: [
+                CallbackQueryHandler(orient_horizontal, pattern="^orient_h$"),
+                CallbackQueryHandler(orient_vertical, pattern="^orient_v$"),
             ],
             VIDEO: [
                 MessageHandler(filters.Document.ALL | filters.VIDEO, process_video),

@@ -739,6 +739,10 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
 
     # ====== БЛОК ОЦЕНОК ======
     if scores:
+        # Если до конца страницы мало места — начинаем блок с новой страницы,
+        # чтобы оценки не разорвались между страницами.
+        if pdf.get_y() > pdf.h - 90:
+            pdf.add_page()
         labels = {
             "ru": {"title": "ОЦЕНКА ИГРЫ", "footwork": "Работа ног",
                    "technique": "Техника", "tactics": "Тактика",

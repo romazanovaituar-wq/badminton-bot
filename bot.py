@@ -187,14 +187,62 @@ def _download_gdrive(url: str, dest_path: str) -> bool:
                      "Проверь что доступ открыт 'всем у кого есть ссылка'.")
     return ok
 
-def _save_frame(frame, output_dir: str, index: int, time_s: float) -> dict:
-    """Сохраняет кадр с ресайзом и возвращает метаданные."""
+def _save_frame(frame, output_dir: str, index: int, time_s: float,
+                rotation: int = 0) -> dict:
+    """Сохраняет кадр с ресайзом + коррекцией ориентации."""
+    # Корректируем ротацию (вертикальные видео с телефона)
+    if rotation:
+        frame = _auto_rotate_frame(frame, rotation)
     h, w = frame.shape[:2]
     if w > 800:
         frame = cv2.resize(frame, (800, int(h * 800 / w)))
     path = f"{output_dir}/frame_{index:03d}.jpg"
     cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return {"path": path, "time": time_s}
+
+
+def _get_video_rotation(video_path: str) -> int:
+    """
+    Читает угол ротации видео из метаданных (EXIF/MP4).
+    Вертикальное видео с телефона обычно имеет rotation=90 или 270.
+    Возвращает угол (0, 90, 180, 270) или 0 если не определить.
+    """
+    try:
+        import subprocess, json
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", video_path],
+            capture_output=True, text=True, timeout=10
+        )
+        data = json.loads(result.stdout)
+        for stream in data.get("streams", []):
+            # Ротация бывает в tags или side_data_list
+            tags = stream.get("tags", {})
+            rot = tags.get("rotate") or tags.get("Rotate")
+            if rot:
+                return int(rot)
+            for sd in stream.get("side_data_list", []):
+                if sd.get("side_data_type") == "Display Matrix":
+                    rot = sd.get("rotation")
+                    if rot is not None:
+                        return abs(int(rot))
+    except Exception:
+        pass
+    return 0
+
+
+def _auto_rotate_frame(frame, rotation: int):
+    """
+    Поворачивает кадр на нужный угол чтобы компенсировать ротацию видео.
+    rotation — угол из метаданных видео.
+    """
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame  # 0 или неизвестный — не трогаем
 
 
 def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
@@ -208,6 +256,10 @@ def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    # Определяем ротацию видео (телефоны часто снимают вертикально)
+    rotation = _get_video_rotation(video_path)
+    if rotation:
+        logger.info("Видео ротация: %d° — кадры будут повёрнуты", rotation)
 
     # --- Уровень 1: motion detection ---
     motion: list[dict] = []
@@ -224,7 +276,7 @@ def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
             if prev_gray is not None:
                 diff = cv2.absdiff(gray, prev_gray).mean()
                 if diff > MOTION_THRESHOLD and (idx - last_saved) > fps:
-                    motion.append(_save_frame(frame, output_dir, len(motion), idx / fps))
+                    motion.append(_save_frame(frame, output_dir, len(motion), idx / fps, rotation))
                     last_saved = idx
             prev_gray = gray
         idx += 1
@@ -269,7 +321,7 @@ def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
         active = sorted(candidates, key=lambda c: c[2], reverse=True)[:MAX_FRAMES]
         active.sort(key=lambda c: c[1])  # по времени
         for frame, t_sec, _score in active:
-            uniform.append(_save_frame(frame, output_dir, len(uniform), t_sec))
+            uniform.append(_save_frame(frame, output_dir, len(uniform), t_sec, rotation))
 
     if len(uniform) >= 3:
         cap.release()
@@ -291,7 +343,7 @@ def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
         if not ret:
             break
         if idx % 10 == 0:
-            any_frames.append(_save_frame(frame, output_dir, len(any_frames), idx / fps))
+            any_frames.append(_save_frame(frame, output_dir, len(any_frames), idx / fps, rotation))
         idx += 1
     cap.release()
     logger.info("Извлечено %d кадров (fallback)", len(any_frames))

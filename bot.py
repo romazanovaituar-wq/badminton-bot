@@ -1472,14 +1472,16 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not users:
         await update.message.reply_text("Пока нет пользователей.")
         return
-    lines = ["👥 *Последние пользователи:*\n"]
+    lines = ["👥 Последние пользователи:\n"]
     for u in users:
         uname = f"@{u['username']}" if u["username"] else "—"
         lines.append(
-            f"`{u['user_id']}` {u['first_name'] or ''} {uname}\n"
+            f"ID: {u['user_id']} | {u['first_name'] or ''} {uname}\n"
             f"   💳 {u['credits']} | 🎬 {u['analyses_count']} | 🌐 {u['lang']}"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    # Без Markdown — имена юзеров могут содержать спецсимволы (_ * `),
+    # которые ломают парсинг. Простой текст надёжнее.
+    await update.message.reply_text("\n".join(lines))
 
 
 async def admin_give(update: Update, context: ContextTypes.DEFAULT_TYPE):

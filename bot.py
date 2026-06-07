@@ -651,13 +651,20 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
             pdf.set_text_color(*GOLD)
             pdf.cell(0, 7, cap, new_x="LMARGIN", new_y="NEXT")
             pdf.ln(2)
-            # Вставляем картинку по центру, ширина ~90мм
-            img_w = 90
+            # Вставляем картинку по центру, ширина 85мм. Высоту считаем
+            # по реальным пропорциям картинки, чтобы курсор не наложился.
+            img_w = 85
+            try:
+                import cv2 as _cv2
+                _im = _cv2.imread(skeleton_path)
+                ratio = (_im.shape[0] / _im.shape[1]) if _im is not None else 0.6
+            except Exception:
+                ratio = 0.6
+            img_h = img_w * ratio
             x = (pdf.w - img_w) / 2
             y = pdf.get_y()
             pdf.image(skeleton_path, x=x, y=y, w=img_w)
-            # Сдвигаем курсор ниже картинки (высота ~ пропорция, берём с запасом)
-            pdf.set_y(y + img_w * 0.66 + 6)
+            pdf.set_y(y + img_h + 8)  # реальная высота + отступ
         except Exception:
             pass
 
@@ -672,10 +679,16 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
             pdf.cell(0, 7, cap, new_x="LMARGIN", new_y="NEXT")
             pdf.ln(2)
             img_w = 60
+            try:
+                import cv2 as _cv2
+                _im = _cv2.imread(heatmap_path)
+                ratio = (_im.shape[0] / _im.shape[1]) if _im is not None else 1.33
+            except Exception:
+                ratio = 1.33
             x = (pdf.w - img_w) / 2
             y = pdf.get_y()
             pdf.image(heatmap_path, x=x, y=y, w=img_w)
-            pdf.set_y(y + img_w * 1.33 + 6)
+            pdf.set_y(y + img_w * ratio + 8)
         except Exception:
             pass
 
@@ -700,19 +713,24 @@ def _generate_pdf_sync(report: str, name: str, frames_count: int,
                 pdf.ln(1)
                 pdf.set_font("Roboto", "", 10)
                 pdf.set_text_color(220, 220, 220)
-                dist = extra_metrics.get("total_distance")
                 knee = extra_metrics.get("knee_flex")
                 ls = extra_metrics.get("leg_stretch")
                 mv = extra_metrics.get("movement")
+                # Словесные оценки вместо сырых чисел — понятнее игроку
+                def word_level(val, lo, hi, lang):
+                    w = {"ru": ["низкая", "средняя", "высокая"],
+                         "kz": ["төмен", "орташа", "жоғары"],
+                         "en": ["low", "medium", "high"]}.get(lang, ["low","mid","high"])
+                    if val < lo: return w[0]
+                    if val < hi: return w[1]
+                    return w[2]
                 rows = []
-                if dist is not None:
-                    rows.append(f"{labels['dist']}: ~{dist} усл.ед.")
-                if ls is not None:
-                    rows.append(f"{labels['stretch']}: {round(ls*100)}%")
                 if knee is not None:
                     rows.append(f"{labels['knee']}: {knee}°")
+                if ls is not None:
+                    rows.append(f"{labels['stretch']}: {round(ls*100)}%")
                 if mv is not None:
-                    rows.append(f"{labels['active']}: {mv}")
+                    rows.append(f"{labels['active']}: {word_level(mv, 2.5, 6, lang)}")
                 for r in rows:
                     pdf.cell(0, 6, "  • " + r, new_x="LMARGIN", new_y="NEXT")
                 pdf.ln(4)

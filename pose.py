@@ -528,3 +528,70 @@ def detect_upside_down(frame_paths: list[str]) -> bool:
 
     # Перевёрнут если большинство кадров за это
     return upside_votes > normal_votes and upside_votes >= 2
+
+
+def detect_best_rotation(frame_paths: list[str]) -> int:
+    """
+    Определяет ЛУЧШИЙ поворот кадров по позе игрока.
+    Пробует 4 варианта (0, 90, 180, 270) и выбирает где поза человека
+    выглядит наиболее естественно: голова сверху, ноги снизу, тело вертикально.
+    Возвращает угол поворота (0/90/180/270) который надо применить.
+
+    Это полностью автоматически — не зависит от ввода пользователя.
+    """
+    if not _MP_AVAILABLE:
+        return 0
+    try:
+        import cv2
+        mp_pose = mp.solutions.pose
+    except Exception:
+        return 0
+
+    # Берём несколько кадров для надёжности
+    sample = frame_paths[:8]
+    rotations = {0: None, 90: cv2.ROTATE_90_CLOCKWISE,
+                 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    scores = {0: 0.0, 90: 0.0, 180: 0.0, 270: 0.0}
+
+    try:
+        with mp_pose.Pose(
+            static_image_mode=True, model_complexity=1,
+            min_detection_confidence=0.5,
+        ) as pose:
+            for path in sample:
+                img0 = cv2.imread(path)
+                if img0 is None:
+                    continue
+                for angle, rot_code in rotations.items():
+                    img = img0 if rot_code is None else cv2.rotate(img0, rot_code)
+                    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    res = pose.process(rgb)
+                    if not res.pose_landmarks:
+                        continue
+                    lm = res.pose_landmarks.landmark
+                    L = mp_pose.PoseLandmark
+                    nose = lm[L.NOSE]
+                    lhip, rhip = lm[L.LEFT_HIP], lm[L.RIGHT_HIP]
+                    lank, rank = lm[L.LEFT_ANKLE], lm[L.RIGHT_ANKLE]
+                    # Качество "правильной" ориентации:
+                    # нос выше бёдер, бёдра выше лодыжек (человек стоит)
+                    vis = (nose.visibility + lhip.visibility + rhip.visibility) / 3
+                    if vis < 0.3:
+                        continue
+                    hip_y = (lhip.y + rhip.y) / 2
+                    ank_y = (lank.y + rank.y) / 2
+                    s = 0.0
+                    if nose.y < hip_y:      # голова выше бёдер
+                        s += 1.0
+                    if hip_y < ank_y:        # бёдра выше лодыжек
+                        s += 1.0
+                    s *= vis
+                    scores[angle] += s
+    except Exception:
+        return 0
+
+    best = max(scores, key=scores.get)
+    # Если лучший вариант 0 или все нули — не поворачиваем
+    if scores[best] == 0:
+        return 0
+    return best

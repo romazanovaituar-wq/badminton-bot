@@ -64,7 +64,7 @@ ADMIN_USERNAME   = os.environ.get("ADMIN_USERNAME", "@N1world1N")  # для св
 def _is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
-GAME_TYPE, IDENTIFY, SHIRT_COLOR, POSITION, VIDEO, ORIENT = range(6)
+GAME_TYPE, IDENTIFY, SHIRT_COLOR, POSITION, VIDEO = range(5)
 
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
 
@@ -247,7 +247,7 @@ def _auto_rotate_frame(frame, rotation: int):
     return frame  # 0 или неизвестный — не трогаем
 
 
-def _extract_frames_sync(video_path: str, output_dir: str, force_rotate: bool = False) -> list[dict]:
+def _extract_frames_sync(video_path: str, output_dir: str) -> list[dict]:
     """
     Надёжное извлечение кадров с трёхуровневым фоллбэком:
     1) кадры с движением (умный выбор)
@@ -259,12 +259,10 @@ def _extract_frames_sync(video_path: str, output_dir: str, force_rotate: bool = 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     # Определяем ротацию видео (телефоны часто снимают вертикально)
+    # Поворот по метаданным видео (если есть тег rotate)
     rotation = _get_video_rotation(video_path)
-    if not rotation and force_rotate:
-        # Пользователь сказал что снимал вертикально — поворачиваем на 90°
-        rotation = 90
     if rotation:
-        logger.info("Видео ротация: %d° — кадры будут повёрнуты", rotation)
+        logger.info("Видео ротация из метаданных: %d°", rotation)
 
     # --- Уровень 1: motion detection ---
     motion: list[dict] = []
@@ -1198,8 +1196,8 @@ async def identify_both(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     lang = db.get_lang(q.from_user.id)
     context.user_data["identify_mode"] = "both"
-    await _ask_orientation(q.message, lang)
-    return ORIENT
+    await q.message.reply_text(t(lang, "ask_video"))
+    return VIDEO
 
 
 async def get_shirt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1207,8 +1205,8 @@ async def get_shirt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = db.get_lang(uid)
     context.user_data["identify_mode"] = "color"
     context.user_data["shirt"] = update.message.text.strip()[:100]
-    await _ask_orientation(update.message, lang)
-    return ORIENT
+    await update.message.reply_text(t(lang, "ask_video"))
+    return VIDEO
 
 
 async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1224,48 +1222,24 @@ async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(t(lang, "ask_doubles_color"))
         return SHIRT_COLOR
     else:
-        # Одиночка по позиции — спрашиваем ориентацию
+        # Одиночка по позиции — сразу к видео
         context.user_data["identify_mode"] = "position"
-        await _ask_orientation(q.message, lang)
-        return ORIENT
+        await q.message.reply_text(t(lang, "ask_video"))
+        return VIDEO
 
 
-async def _ask_orientation(message, lang):
-    """Показывает вопрос об ориентации видео перед отправкой."""
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "btn_orient_h"), callback_data="orient_h")],
-        [InlineKeyboardButton(t(lang, "btn_orient_v"), callback_data="orient_v")],
-    ])
-    await message.reply_text(t(lang, "ask_orientation"), reply_markup=kb)
-
-
-async def orient_horizontal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Видео снято горизонтально — поворот не нужен."""
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    context.user_data["force_rotate"] = False
-    await q.message.reply_text(t(lang, "ask_video"))
-    return VIDEO
-
-
-async def orient_vertical(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Видео снято вертикально — повернём кадры при нарезке."""
-    q = update.callback_query
-    await q.answer()
-    lang = db.get_lang(q.from_user.id)
-    context.user_data["force_rotate"] = True
-    await q.message.reply_text(t(lang, "ask_video"))
-    return VIDEO
-
-
-def _flip_frames_180(frame_paths: list[str]) -> None:
-    """Поворачивает сохранённые кадры на 180° (исправление переворота)."""
+def _rotate_frames(frame_paths: list[str], angle: int) -> None:
+    """Поворачивает сохранённые кадры на заданный угол (90/180/270)."""
+    rot_map = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+               270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    rot_code = rot_map.get(angle)
+    if rot_code is None:
+        return
     for p in frame_paths:
         try:
             img = cv2.imread(p)
             if img is not None:
-                img = cv2.rotate(img, cv2.ROTATE_180)
+                img = cv2.rotate(img, rot_code)
                 cv2.imwrite(p, img, [cv2.IMWRITE_JPEG_QUALITY, 85])
         except Exception:
             continue
@@ -1329,21 +1303,21 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Нарезка кадров
         await msg.edit_text(t(lang, "extracting"))
-        force_rotate = context.user_data.get("force_rotate", False)
         frames = await loop.run_in_executor(
-            None, _extract_frames_sync, video_path, frames_dir, force_rotate)
-        # Автоопределение переворота: если игрок вверх ногами — доворачиваем 180°
-        if frames and force_rotate:
+            None, _extract_frames_sync, video_path, frames_dir)
+        # АВТООПРЕДЕЛЕНИЕ ОРИЕНТАЦИИ по позе игрока (не зависит от ввода юзера).
+        # MediaPipe пробует 4 поворота и выбирает где человек стоит правильно.
+        if frames:
             try:
                 fpaths = [f["path"] for f in frames]
-                upside = await loop.run_in_executor(
-                    None, pose.detect_upside_down, fpaths)
-                if upside:
-                    logger.info("Кадры перевёрнуты — доворачиваем 180°")
+                best_rot = await loop.run_in_executor(
+                    None, pose.detect_best_rotation, fpaths)
+                if best_rot:
+                    logger.info("Автоповорот кадров: %d°", best_rot)
                     await loop.run_in_executor(
-                        None, _flip_frames_180, fpaths)
+                        None, _rotate_frames, fpaths, best_rot)
             except Exception as e:
-                logger.warning("Проверка переворота пропущена: %s", e)
+                logger.warning("Автоповорот пропущен: %s", e)
         if len(frames) < 3:
             logger.warning("Мало кадров (%d) для user %s", len(frames), uid)
             await msg.edit_text(t(lang, "err_frames"))
@@ -1757,10 +1731,6 @@ def main() -> None:
             SHIRT_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_shirt)],
             POSITION: [
                 CallbackQueryHandler(get_position, pattern="^pos_(near|far)$"),
-            ],
-            ORIENT: [
-                CallbackQueryHandler(orient_horizontal, pattern="^orient_h$"),
-                CallbackQueryHandler(orient_vertical, pattern="^orient_v$"),
             ],
             VIDEO: [
                 MessageHandler(filters.Document.ALL | filters.VIDEO, process_video),

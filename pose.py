@@ -475,3 +475,56 @@ def render_heatmap(centers: list, out_path: str) -> str | None:
     except Exception as e:
         logger.warning("render_heatmap: ошибка: %s", e)
         return None
+
+
+def detect_upside_down(frame_paths: list[str]) -> bool:
+    """
+    Определяет перевёрнут ли игрок вверх ногами на кадрах.
+    Использует MediaPipe: если нос (голова) НИЖЕ бёдер в кадре —
+    значит изображение перевёрнуто на 180°.
+    Возвращает True если нужно повернуть на 180°.
+    """
+    if not _MP_AVAILABLE:
+        return False
+    try:
+        import cv2
+        mp_pose = mp.solutions.pose
+    except Exception:
+        return False
+
+    upside_votes = 0
+    normal_votes = 0
+    try:
+        with mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            min_detection_confidence=0.5,
+        ) as pose:
+            for path in frame_paths[:10]:  # хватит 10 кадров для голосования
+                try:
+                    img = cv2.imread(path)
+                    if img is None:
+                        continue
+                    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    res = pose.process(rgb)
+                    if not res.pose_landmarks:
+                        continue
+                    lm = res.pose_landmarks.landmark
+                    L = mp_pose.PoseLandmark
+                    # Y растёт вниз. Нос должен быть ВЫШЕ (меньше Y) чем бёдра.
+                    nose_y = lm[L.NOSE].y
+                    hip_y = (lm[L.LEFT_HIP].y + lm[L.RIGHT_HIP].y) / 2
+                    # видимость носа и бёдер должна быть приличной
+                    if (lm[L.NOSE].visibility > 0.3 and
+                            lm[L.LEFT_HIP].visibility > 0.3):
+                        if nose_y > hip_y:
+                            upside_votes += 1   # нос ниже бёдер = перевёрнут
+                        else:
+                            normal_votes += 1
+                except Exception:
+                    continue
+    except Exception:
+        return False
+
+    # Перевёрнут если большинство кадров за это
+    return upside_votes > normal_votes and upside_votes >= 2

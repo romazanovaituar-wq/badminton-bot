@@ -1259,6 +1259,18 @@ async def orient_vertical(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return VIDEO
 
 
+def _flip_frames_180(frame_paths: list[str]) -> None:
+    """Поворачивает сохранённые кадры на 180° (исправление переворота)."""
+    for p in frame_paths:
+        try:
+            img = cv2.imread(p)
+            if img is not None:
+                img = cv2.rotate(img, cv2.ROTATE_180)
+                cv2.imwrite(p, img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        except Exception:
+            continue
+
+
 async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = db.get_lang(uid)
@@ -1320,6 +1332,18 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         force_rotate = context.user_data.get("force_rotate", False)
         frames = await loop.run_in_executor(
             None, _extract_frames_sync, video_path, frames_dir, force_rotate)
+        # Автоопределение переворота: если игрок вверх ногами — доворачиваем 180°
+        if frames and force_rotate:
+            try:
+                fpaths = [f["path"] for f in frames]
+                upside = await loop.run_in_executor(
+                    None, pose.detect_upside_down, fpaths)
+                if upside:
+                    logger.info("Кадры перевёрнуты — доворачиваем 180°")
+                    await loop.run_in_executor(
+                        None, _flip_frames_180, fpaths)
+            except Exception as e:
+                logger.warning("Проверка переворота пропущена: %s", e)
         if len(frames) < 3:
             logger.warning("Мало кадров (%d) для user %s", len(frames), uid)
             await msg.edit_text(t(lang, "err_frames"))

@@ -196,11 +196,27 @@ def get_stats() -> dict:
             """)
             active_week = cur.fetchone()["active"]
 
+            # Платежи (таблица может ещё не существовать или быть пустой)
+            total_payments = 0
+            total_stars = 0
+            try:
+                cur.execute("""
+                    SELECT COUNT(*) AS cnt, COALESCE(SUM(stars), 0) AS stars
+                    FROM payments;
+                """)
+                row = cur.fetchone()
+                total_payments = row["cnt"]
+                total_stars = row["stars"]
+            except Exception:
+                pass
+
             return {
                 "total_users": total_users,
                 "total_analyses": total_analyses,
                 "total_credits": total_credits,
                 "active_week": active_week,
+                "total_payments": total_payments,
+                "total_stars": total_stars,
             }
 
 

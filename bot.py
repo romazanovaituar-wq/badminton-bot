@@ -1460,7 +1460,9 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Всего пользователей: {s['total_users']}\n"
         f"🎬 Всего анализов: {s['total_analyses']}\n"
         f"💳 Кредитов на балансах: {s['total_credits']}\n"
-        f"🔥 Анализов за 7 дней: {s['active_week']}"
+        f"🔥 Анализов за 7 дней: {s['active_week']}\n\n"
+        f"💰 Покупок: {s.get('total_payments', 0)}\n"
+        f"⭐ Заработано звёзд: {s.get('total_stars', 0)}"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
